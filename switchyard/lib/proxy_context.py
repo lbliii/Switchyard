@@ -65,6 +65,11 @@ CTX_UPSTREAM_HTTP_BODY = "_upstream_http_body"
 #: loop — those rely on the endpoint fallback.
 CTX_UPSTREAM_ATTEMPTS_RECORDED = "_upstream_attempts_recorded"
 
+#: Client-visible successful fallback marker. Endpoints surface this as
+#: ``x-switchyard-fallback`` so callers can distinguish normal 200 responses
+#: from availability-preserving fallback paths.
+CTX_SWITCHYARD_FALLBACK = "_switchyard_fallback"
+
 
 __all__ = [
     "CTX_CALLER_API_KEY",
@@ -74,6 +79,7 @@ __all__ = [
     "CTX_PROXY_ACTUAL_MODEL",
     "CTX_ROUTING",
     "CTX_TARGET_FORMAT",
+    "CTX_SWITCHYARD_FALLBACK",
     "CTX_UPSTREAM_ATTEMPTS_RECORDED",
     "CTX_UPSTREAM_HTTP_BODY",
     "CTX_UPSTREAM_HTTP_STATUS",

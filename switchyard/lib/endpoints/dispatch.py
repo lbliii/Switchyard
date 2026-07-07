@@ -10,7 +10,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from switchyard.lib.endpoints.error_envelope import error_response
 from switchyard.lib.endpoints.upstream_error import record_upstream_attempt_success
-from switchyard.lib.proxy_context import ProxyContext
+from switchyard.lib.proxy_context import (
+    CTX_SWITCHYARD_FALLBACK,
+    ProxyContext,
+)
 from switchyard.lib.roles import TranslatedResponse
 from switchyard.lib.route_table import RouteTable
 from switchyard_rust.core import ChatRequest
@@ -96,6 +99,7 @@ def serialize_chain_result(
     *,
     stream: bool,
     sse_iter: Callable[[Any], AsyncIterator[str]],
+    ctx: ProxyContext | None = None,
 ) -> Response:
     """Serialize a chain result to the appropriate HTTP response.
 
@@ -103,9 +107,21 @@ def serialize_chain_result(
     ``StreamingResponse`` when streaming is requested, or JSON-serializes it.
     """
     if isinstance(result, Response):
-        return result
+        return _attach_switchyard_headers(result, ctx)
     if stream and hasattr(result, "__aiter__"):
-        return StreamingResponse(sse_iter(result), media_type="text/event-stream")
+        return _attach_switchyard_headers(
+            StreamingResponse(sse_iter(result), media_type="text/event-stream"),
+            ctx,
+        )
     if hasattr(result, "model_dump"):
-        return JSONResponse(content=result.model_dump())
-    return JSONResponse(content=result)
+        return _attach_switchyard_headers(JSONResponse(content=result.model_dump()), ctx)
+    return _attach_switchyard_headers(JSONResponse(content=result), ctx)
+
+
+def _attach_switchyard_headers(response: Response, ctx: ProxyContext | None) -> Response:
+    if ctx is None:
+        return response
+    fallback = ctx.metadata.get(CTX_SWITCHYARD_FALLBACK)
+    if isinstance(fallback, str) and fallback:
+        response.headers["x-switchyard-fallback"] = fallback
+    return response
