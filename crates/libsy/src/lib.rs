@@ -268,8 +268,10 @@ pub fn llm_promise(
 pub struct OrchestratorContext {
     // The current request's promise sender, or `None` when offloading is
     // unavailable (direct mode). Private: only the orchestrator populates it, and
-    // only `LlmTarget::call` reads it to offload.
-    promise_tx: Option<tokio::sync::mpsc::Sender<LlmPromiseTx>>,
+    // only `LlmTarget::call` reads it to offload. Unbounded so an algorithm can
+    // hand off a promise without awaiting channel capacity (it then awaits the
+    // response); the driver drains it promptly.
+    promise_tx: Option<tokio::sync::mpsc::UnboundedSender<LlmPromiseTx>>,
 }
 
 /// One item in the stream returned by [`MultiLlmOrchestrator::orchestrate`].
@@ -351,17 +353,14 @@ impl LlmTarget {
                 // No client: offload via a promise on this request's channel,
                 // attaching the decision so the orchestrator can surface it on its
                 // stream. The context has no channel outside an orchestrate() run.
-                let promise_tx = ctx.promise_tx.clone().ok_or_else(|| {
+                let promise_tx = ctx.promise_tx.as_ref().ok_or_else(|| {
                     format!(
                         "target '{}' has no client and no offload channel",
                         self.name
                     )
                 })?;
                 let (tx, mut rx) = llm_promise(request, decision);
-                promise_tx
-                    .send(tx)
-                    .await
-                    .map_err(|_| "Failed to send promise")?;
+                promise_tx.send(tx).map_err(|_| "Failed to send promise")?;
                 rx.get_response().await
             }
         }
@@ -487,7 +486,7 @@ impl MultiLlmOrchestrator {
         // requests get independent channels, so offloaded promises never cross
         // between requests. Nothing here is shared or locked, so many `orchestrate`
         // calls run in parallel.
-        let (promise_tx, mut promise_rx) = tokio::sync::mpsc::channel::<LlmPromiseTx>(10);
+        let (promise_tx, mut promise_rx) = tokio::sync::mpsc::unbounded_channel::<LlmPromiseTx>();
         let ctx = OrchestratorContext {
             promise_tx: Some(promise_tx),
         };
