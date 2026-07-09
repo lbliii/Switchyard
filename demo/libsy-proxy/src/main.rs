@@ -210,9 +210,14 @@ fn routing_metadata(trace: &[Arc<dyn DecisionTrace>]) -> RoutingMetadata {
 fn build_orchestrator() -> Result<MultiLlmOrchestrator> {
     let base_url =
         std::env::var("LIBSY_PROXY_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
+        SwitchyardError::InvalidConfig(
+            "ANTHROPIC_API_KEY must be set to upstream bearer key".into(),
+        )
+    })?;
     let endpoint = EndpointConfig {
         base_url: Some(base_url),
-        api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+        api_key: Some(api_key),
         timeout_secs: Some(120.0),
     };
     let backend = Arc::new(OpenAiPassthroughBackend::new(endpoint)?);
