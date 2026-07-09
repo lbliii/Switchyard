@@ -72,20 +72,21 @@ and a stateful fan-out → judge → commit ensemble in [`src/ensemble.rs`](src/
 ```rust
 #[async_trait]
 impl OrchAlgo for LlmClassifierOrchAlgo {
-    async fn process_request(&self, request: OrchestratorRequest)
+    // `ctx` is threaded straight into each target.call (it carries the offload channel).
+    async fn process_request(&self, ctx: &OrchestratorContext, request: OrchestratorRequest)
         -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
 
         // 1. Classify: call the classifier target for a score.
         let classifier = self.target_set.get_target(&self.classifier_model)?;
         let classify_req = /* OrchestratorRequest with preamble + user_prompt */;
-        let score = classifier.call(classify_req, Some(classify_decision.clone())).await?
+        let score = classifier.call(ctx, classify_req, Some(classify_decision.clone())).await?
             .llm_response.completion.trim().parse::<f64>().ok();
 
         // 2. Route: strong if score >= threshold, else weak (fail open on None).
         let model = if score.map_or(true, |s| s >= self.threshold) { &self.strong_model } else { &self.weak_model };
         let routed = self.target_set.get_target(model)?;
-        let response = routed.call(routed_req, Some(route_decision.clone())).await?;
+        let response = routed.call(ctx, routed_req, Some(route_decision.clone())).await?;
 
         Ok((vec![classify_decision, route_decision], response))   // trace: classify + route
     }
