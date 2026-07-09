@@ -15,7 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use libsy::llm_class::LlmClassifierOrchAlgoBuilder;
 use libsy::{
-    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, LlmTargetSet,
+    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet,
     MultiLlmOrchestrator, OrchestratorRequest, OrchestratorResponse,
 };
 
@@ -30,10 +30,9 @@ struct StubClient;
 impl LlmClient for StubClient {
     async fn call(
         &self,
-        _request: OrchestratorRequest,
-        model_name: Option<String>,
+        request: OrchestratorRequest,
     ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-        let model = model_name.unwrap_or_default();
+        let model = request.llm_request.model_name.clone();
         println!("  -> model call: {model}");
         // The classifier returns a score; other models return an answer.
         let completion = if model == CLASSIFIER {
@@ -53,11 +52,10 @@ impl LlmClient for StubClient {
 
 fn targets() -> LlmTargetSet {
     let client = Arc::new(StubClient) as Arc<dyn LlmClient>;
-    let target = |name: &str| {
-        Arc::new(LlmTarget {
-            name: name.to_string(),
-            llm_client: Some(client.clone()),
-        }) as Arc<dyn LlmTargetI>
+    let target = |name: &str| LlmTarget {
+        name: name.to_string(),
+        model: name.to_string(),
+        llm_client: Some(client.clone()),
     };
     LlmTargetSet::new(vec![target(CLASSIFIER), target(STRONG), target(WEAK)])
 }

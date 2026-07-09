@@ -24,7 +24,9 @@ trace plus the final response.
 #[async_trait]
 pub trait OrchAlgo: Send + Sync {
     // `&self`, not `&mut self`: one shared algorithm serves requests in parallel.
-    async fn process_request(&self, request: OrchestratorRequest)
+    // `ctx` carries this request's offload channel; the algorithm just threads it
+    // through to each `target.call`.
+    async fn process_request(&self, ctx: &OrchestratorContext, request: OrchestratorRequest)
         -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>;
     async fn process_signals(&self, signals: AgentSysSignals)
         -> Result<(), Box<dyn Error + Send + Sync>>;
@@ -49,25 +51,34 @@ otherwise offload a call that nobody fulfills, deadlocking).
 
 ## Targets and offloading
 
-A target is decision-agnostic and reused across requests:
+A target is a plain value — a name, the provider model id, and an optional client:
 
 ```rust
-#[async_trait]
-pub trait LlmTargetI: Send + Sync {
-    fn get_name(&self) -> &str;
-    fn get_client(&self) -> Option<Arc<dyn LlmClient>>;
-    async fn call(&self, request: OrchestratorRequest, decision: Option<Arc<dyn DecisionTrace>>)
+pub struct LlmTarget {
+    pub name: String,                           // routing label the algorithm selects by ("strong")
+    pub model: String,                          // provider model id the client calls ("openai/gpt-4o")
+    pub llm_client: Option<Arc<dyn LlmClient>>, // `None` -> the call is offloaded
+}
+
+impl LlmTarget {
+    // `ctx` carries the per-request offload channel a client-less target uses.
+    pub async fn call(&self, ctx: &OrchestratorContext, request: OrchestratorRequest,
+                      decision: Option<Arc<dyn DecisionTrace>>)
         -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>>;
 }
 ```
 
+An algorithm routes by **name** — a logical label like `"strong"`/`"weak"` (or a model id when they
+coincide). Before the call reaches the client, the target stamps its **model** (the provider id) onto
+`request.llm_request.model_name`, so `LlmClient::call` — which takes only the request — always knows
+the concrete model to hit. Name and model let routing stay abstract while the client stays concrete.
+
 - **`LlmTarget` with a client** serves its own call (`LlmClient::call`).
-- **A client-less target**, once wrapped by the orchestrator (`WrappedLlmTarget`), **offloads**: it
-  makes a promise (`llm_promise`), sends it on the orchestrator's channel, and awaits the response.
-  The orchestrator surfaces the promise as a `CallLlm` step; the caller performs the real model call
-  and fulfills it with `set_response(Ok(response))` — or `set_response(Err(..))` to propagate a failed
-  call back into the algorithm. To the algorithm, `target.call` just returned (or errored) — the
-  offload is invisible.
+- **A client-less target** **offloads**: it makes a promise (`llm_promise`), sends it on the promise
+  channel carried in the per-request `OrchestratorContext`, and awaits the response. The orchestrator
+  surfaces the promise as a `CallLlm` step; the caller performs the real model call and fulfills it
+  with `set_response(Ok(response))` — or `set_response(Err(..))` to propagate a failed call back into
+  the algorithm. To the algorithm, `target.call` just returned (or errored) — the offload is invisible.
 
 The decision the algorithm attached rides along on the promise (`get_decision`), so the stream
 consumer knows *why* each call is being made.
@@ -95,11 +106,11 @@ pub trait OrchAlgoBuilder: Send + Sync {
     fn with_target_set(&mut self, target_set: LlmTargetSet);
     fn build(&mut self) -> Box<dyn OrchAlgo>;
 }
-// MultiLlmOrchestrator::new(builder, Some(target_set)) wraps the targets (so offloaded calls reach
-// its promise channel), hands them to the builder, and builds the algo.
+// MultiLlmOrchestrator::new(builder, Some(target_set)) hands the target set to the builder and builds
+// the algo. Offloading is wired per request by the OrchestratorContext, not at construction.
 ```
 
-The algorithm never constructs its own targets; the orchestrator wraps them and passes them via the
+The algorithm never constructs its own targets; the orchestrator passes the target set via the
 builder. An algorithm selects among targets with `LlmTargetSet::targets()` / `get_target(name)`.
 
 ## Reference algorithms
@@ -133,8 +144,9 @@ control flow, not orchestrator machinery.
   `orchestrate` / `orchestrate_direct` at once. An algorithm is responsible for its own thread-safety
   — stateless (like the reference routers), or interior mutability over just its own state.
 - **Per-request promise channel.** `orchestrate` makes a fresh channel per call and passes the sender
-  to `process_request` via a task-local (`PROMISE_TX`), so concurrent requests never share a channel
-  and their offloaded promises cannot cross.
+  in an `OrchestratorContext` threaded (by reference) through `process_request` to each `target.call`,
+  so concurrent requests never share a channel and their offloaded promises cannot cross — no global
+  or task-local state.
 - `process_request` runs on its own task so it can block awaiting a promise response while the driver
   forwards `CallLlm` steps to the caller — the driver `select!`s promise-forwarding against
   algorithm-completion.

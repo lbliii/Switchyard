@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use libsy::llm_class::{ClassifierDecision, LlmClassifierOrchAlgoBuilder};
 use libsy::{
-    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, LlmTargetSet,
+    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet,
     MultiLlmOrchestrator, OrchestratorRequest, OrchestratorResponse,
 };
 
@@ -66,9 +66,8 @@ impl LlmClient for SwitchyardBackendClient {
     async fn call(
         &self,
         request: OrchestratorRequest,
-        model_name: Option<String>,
     ) -> std::result::Result<OrchestratorResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let model = model_name.unwrap_or(request.llm_request.model_name);
+        let model = request.llm_request.model_name.clone();
         // Build a single-shot OpenAI chat request for the chosen model.
         let body = json!({
             "model": model,
@@ -219,12 +218,12 @@ fn build_orchestrator() -> Result<MultiLlmOrchestrator> {
     let backend = Arc::new(OpenAiPassthroughBackend::new(endpoint)?);
     let client = Arc::new(SwitchyardBackendClient { backend }) as Arc<dyn LlmClient>;
 
-    // One target per model id; all backed by the same upstream client.
-    let target = |name: &str| {
-        Arc::new(LlmTarget {
-            name: name.to_string(),
-            llm_client: Some(client.clone()),
-        }) as Arc<dyn LlmTargetI>
+    // One target per model id; all backed by the same upstream client. Here the
+    // routing name and provider model id coincide, so `model` mirrors `name`.
+    let target = |name: &str| LlmTarget {
+        name: name.to_string(),
+        model: name.to_string(),
+        llm_client: Some(client.clone()),
     };
     let targets = LlmTargetSet::new(vec![
         target(CLASSIFIER_MODEL),

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use crate::{
     AgentSysSignals, DecisionTrace, LlmRequest, LlmTargetSet, OrchAlgo, OrchAlgoBuilder,
-    OrchestratorRequest, OrchestratorResponse,
+    OrchestratorContext, OrchestratorRequest, OrchestratorResponse,
 };
 
 /// Preamble prepended to the user prompt when asking the classifier target for a
@@ -80,6 +80,7 @@ pub struct LlmClassifierOrchAlgo {
 impl OrchAlgo for LlmClassifierOrchAlgo {
     async fn process_request(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
     {
@@ -102,7 +103,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
             tier: None,
         });
         let classify_response = classifier_target
-            .call(classify_request, Some(classify_decision.clone()))
+            .call(ctx, classify_request, Some(classify_decision.clone()))
             .await?;
         let score = classify_response
             .llm_response
@@ -137,7 +138,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
             metadata: request.metadata,
         };
         let response = routed_target
-            .call(routed_request, Some(route_decision.clone()))
+            .call(ctx, routed_request, Some(route_decision.clone()))
             .await?;
 
         Ok((vec![classify_decision, route_decision], response))
@@ -206,7 +207,7 @@ impl OrchAlgoBuilder for LlmClassifierOrchAlgoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
     use std::sync::Mutex;
 
     /// Returns `score` for the classifier target, an answer tagged with the model
@@ -223,9 +224,8 @@ mod tests {
         async fn call(
             &self,
             request: OrchestratorRequest,
-            model_name: Option<String>,
         ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-            let name = model_name.unwrap_or_default();
+            let name = request.llm_request.model_name.clone();
             let completion = if name == self.classifier_model {
                 self.score.clone()
             } else {
@@ -253,11 +253,10 @@ mod tests {
             score: score.to_string(),
             seen: Arc::clone(&seen),
         }) as Arc<dyn LlmClient>;
-        let target = |name: &str| {
-            Arc::new(LlmTarget {
-                name: name.to_string(),
-                llm_client: Some(client.clone()),
-            }) as Arc<dyn LlmTargetI>
+        let target = |name: &str| LlmTarget {
+            name: name.to_string(),
+            model: name.to_string(),
+            llm_client: Some(client.clone()),
         };
         let target_set = LlmTargetSet::new(vec![
             target("router/classifier"),
@@ -285,6 +284,11 @@ mod tests {
         }
     }
 
+    // Every test target has a client, so a channel-less context is enough.
+    fn ctx() -> OrchestratorContext {
+        OrchestratorContext::default()
+    }
+
     /// Downcast a trace entry to the concrete classifier decision.
     fn as_classifier(
         d: &Arc<dyn DecisionTrace>,
@@ -298,7 +302,9 @@ mod tests {
     async fn score_at_or_above_threshold_routes_strong() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         let (algo, _) = algo(0.5, "0.9");
-        let (trace, response) = algo.process_request(request("solve this proof")).await?;
+        let (trace, response) = algo
+            .process_request(&ctx(), request("solve this proof"))
+            .await?;
         assert_eq!(
             response.llm_response.completion,
             "answer from frontier/model"
@@ -315,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn score_below_threshold_routes_weak() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(0.5, "0.2");
-        let (trace, response) = algo.process_request(request("say hello")).await?;
+        let (trace, response) = algo.process_request(&ctx(), request("say hello")).await?;
         assert_eq!(response.llm_response.completion, "answer from cheap/model");
         let routed = as_classifier(&trace[1])?;
         assert_eq!(routed.tier, Some(ClassifierTier::Weak));
@@ -327,7 +333,7 @@ mod tests {
     async fn score_exactly_at_threshold_routes_strong() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         let (algo, _) = algo(0.5, "0.5");
-        let (_, response) = algo.process_request(request("borderline")).await?;
+        let (_, response) = algo.process_request(&ctx(), request("borderline")).await?;
         assert_eq!(
             response.llm_response.completion,
             "answer from frontier/model"
@@ -338,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn unparseable_score_defaults_to_strong() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(0.5, "not-a-number");
-        let (trace, response) = algo.process_request(request("hi")).await?;
+        let (trace, response) = algo.process_request(&ctx(), request("hi")).await?;
         assert_eq!(
             response.llm_response.completion,
             "answer from frontier/model"
@@ -353,7 +359,7 @@ mod tests {
     async fn classifier_prompt_includes_the_user_text() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         let (algo, seen) = algo(0.5, "0.9");
-        algo.process_request(request("prove it")).await?;
+        algo.process_request(&ctx(), request("prove it")).await?;
         let seen = seen.lock().map_err(|_| "lock poisoned")?;
         // Two calls: the classifier (preamble + user text), then the routed model.
         assert_eq!(seen.len(), 2);

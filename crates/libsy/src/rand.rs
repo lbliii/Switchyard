@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use rand::seq::SliceRandom;
 
 use crate::{
-    AgentSysSignals, DecisionTrace, LlmTargetSet, OrchAlgo, OrchAlgoBuilder, OrchestratorRequest,
-    OrchestratorResponse,
+    AgentSysSignals, DecisionTrace, LlmTargetSet, OrchAlgo, OrchAlgoBuilder, OrchestratorContext,
+    OrchestratorRequest, OrchestratorResponse,
 };
 
 /// Decision produced by [`RandomOrchAlgo`]: which target was chosen and why.
@@ -56,6 +56,7 @@ impl RandomOrchAlgo {
 impl OrchAlgo for RandomOrchAlgo {
     async fn process_request(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
     {
@@ -71,15 +72,15 @@ impl OrchAlgo for RandomOrchAlgo {
                 .clone()
         };
 
-        // Build the decision once, share it (Arc) between the call it annotates
-        // and the returned trace.
-        let selected = target.get_name().to_string();
+        // Route by target name; the target maps it to the provider model id when
+        // it serves or offloads the call.
+        let selected = target.name.clone();
         let decision: Arc<dyn DecisionTrace> = Arc::new(RandomDecision {
             reasoning: format!("random routing selected target '{selected}'"),
             selected_model: selected,
         });
 
-        let response = target.call(request, Some(decision.clone())).await?;
+        let response = target.call(ctx, request, Some(decision.clone())).await?;
         Ok((vec![decision], response))
     }
 
@@ -115,7 +116,7 @@ impl OrchAlgoBuilder for RandomOrchAlgoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
     use std::collections::HashSet;
 
     /// Echoes back the target name it was called with, so a test can tell which
@@ -126,12 +127,11 @@ mod tests {
     impl LlmClient for EchoClient {
         async fn call(
             &self,
-            _request: OrchestratorRequest,
-            model_name: Option<String>,
+            request: OrchestratorRequest,
         ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
             Ok(OrchestratorResponse {
                 llm_response: LlmResponse {
-                    completion: model_name.unwrap_or_default(),
+                    completion: request.llm_request.model_name,
                     raw_response: None,
                 },
                 metadata: None,
@@ -150,14 +150,18 @@ mod tests {
         }
     }
 
+    // Client-less-free tests: a channel-less context, since no call offloads.
+    fn ctx() -> OrchestratorContext {
+        OrchestratorContext::default()
+    }
+
     fn algo(names: &[&str]) -> RandomOrchAlgo {
-        let targets: Vec<Arc<dyn LlmTargetI>> = names
+        let targets: Vec<LlmTarget> = names
             .iter()
-            .map(|name| {
-                Arc::new(LlmTarget {
-                    name: name.to_string(),
-                    llm_client: Some(Arc::new(EchoClient)),
-                }) as Arc<dyn LlmTargetI>
+            .map(|name| LlmTarget {
+                name: name.to_string(),
+                model: name.to_string(),
+                llm_client: Some(Arc::new(EchoClient)),
             })
             .collect();
         RandomOrchAlgo::new(LlmTargetSet::new(targets))
@@ -167,7 +171,7 @@ mod tests {
     async fn single_target_is_always_selected_and_called(
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let algo = algo(&["only/model"]);
-        let (trace, response) = algo.process_request(request()).await?;
+        let (trace, response) = algo.process_request(&ctx(), request()).await?;
         assert_eq!(response.llm_response.completion, "only/model");
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].model_decision(), "only/model");
@@ -180,7 +184,7 @@ mod tests {
         let names = ["a/model", "b/model", "c/model"];
         let algo = algo(&names);
         for _ in 0..50 {
-            let (trace, response) = algo.process_request(request()).await?;
+            let (trace, response) = algo.process_request(&ctx(), request()).await?;
             let selected = response.llm_response.completion.clone();
             assert!(
                 names.contains(&selected.as_str()),
@@ -198,7 +202,7 @@ mod tests {
         let algo = algo(&["a/model", "b/model"]);
         let mut seen = HashSet::new();
         for _ in 0..100 {
-            let (_, response) = algo.process_request(request()).await?;
+            let (_, response) = algo.process_request(&ctx(), request()).await?;
             seen.insert(response.llm_response.completion);
         }
         // 100 uniform draws over two targets: both should appear (miss ~ 2^-99).
@@ -213,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn empty_target_set_errors() {
         let algo = algo(&[]);
-        assert!(algo.process_request(request()).await.is_err());
+        assert!(algo.process_request(&ctx(), request()).await.is_err());
     }
 
     #[tokio::test]
@@ -226,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn decision_is_inspectable_and_downcasts() -> Result<(), Box<dyn Error + Send + Sync>> {
         let algo = algo(&["only/model"]);
-        let (trace, _) = algo.process_request(request()).await?;
+        let (trace, _) = algo.process_request(&ctx(), request()).await?;
         let decision = &trace[0];
         // Uniform, algo-agnostic access via the trait — no concrete type needed.
         assert_eq!(decision.model_decision(), "only/model");

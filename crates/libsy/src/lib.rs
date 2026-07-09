@@ -14,7 +14,7 @@
 //!
 //! - An [`OrchAlgo`] is the optimization *algorithm*. Its
 //!   [`process_request`](OrchAlgo::process_request) runs once per request and
-//!   makes as many model calls as it needs — via [`LlmTargetI::call`], which look
+//!   makes as many model calls as it needs — via [`LlmTarget::call`], which look
 //!   like ordinary calls — then returns a *decision trace* (a list of
 //!   [`DecisionTrace`]) plus the final [`OrchestratorResponse`].
 //! - An [`LlmTarget`] names a model. If it carries an [`LlmClient`] it *serves*
@@ -166,7 +166,7 @@ pub type PromiseResult = Result<OrchestratorResponse, Box<dyn Error + Send + Syn
 /// request it should perform ([`get_request`](Self::get_request)) and the
 /// decision behind it ([`get_decision`](Self::get_decision)), makes the real model
 /// call, and fulfills the promise with [`set_response`](Self::set_response). That
-/// unblocks the algorithm's [`LlmTargetI::call`] on the other side.
+/// unblocks the algorithm's [`LlmTarget::call`] on the other side.
 pub struct LlmPromiseTx {
     request: OrchestratorRequest,
     decision: Option<Arc<dyn DecisionTrace>>,
@@ -175,7 +175,7 @@ pub struct LlmPromiseTx {
 
 /// The algorithm-facing half of an offloaded model call.
 ///
-/// Held inside a client-less [`LlmTargetI::call`], which awaits
+/// Held inside a client-less [`LlmTarget::call`], which awaits
 /// [`get_response`](Self::get_response) until the host fulfills the paired
 /// [`LlmPromiseTx`]. Host code normally does not touch this type directly.
 pub struct LlmPromiseRx {
@@ -254,6 +254,24 @@ pub fn llm_promise(
     (tx, rx)
 }
 
+/// Per-request state the orchestrator threads to each [`LlmTarget::call`].
+///
+/// Its job is to carry the current request's offload channel, so a client-less
+/// target hands its promise to *this* request's channel and never to another's.
+/// Each [`orchestrate`](MultiLlmOrchestrator::orchestrate) run builds its own
+/// context and passes it (by reference) down through the algorithm — which is what
+/// lets many requests run concurrently with no shared or global state. In
+/// [`orchestrate_direct`](MultiLlmOrchestrator::orchestrate_direct) (or when an
+/// algorithm is called directly, e.g. in tests) the context carries no channel, so
+/// an unexpected offload errors instead of going nowhere.
+#[derive(Clone, Default)]
+pub struct OrchestratorContext {
+    // The current request's promise sender, or `None` when offloading is
+    // unavailable (direct mode). Private: only the orchestrator populates it, and
+    // only `LlmTarget::call` reads it to offload.
+    promise_tx: Option<tokio::sync::mpsc::Sender<LlmPromiseTx>>,
+}
+
 /// One item in the stream returned by [`MultiLlmOrchestrator::orchestrate`].
 pub enum OrchestratorStep {
     /// The algorithm needs these model calls performed. The host fulfills each
@@ -275,117 +293,70 @@ pub type OrchestratorStepResult = Result<OrchestratorStep, Box<dyn Error + Send 
 /// calls; one without offloads them (see [`MultiLlmOrchestrator::orchestrate`]).
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// Call `model_name` (falling back to `request.llm_request.model_name`) with
-    /// the given request, returning the model's response.
+    /// Call the model named in `request.llm_request.model_name` with the given
+    /// request, returning the model's response. An algorithm sets that name to
+    /// the target it is routing to before the call, so the client always knows
+    /// which model to hit.
     async fn call(
         &self,
         request: OrchestratorRequest,
-        model_name: Option<String>,
-    ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>>;
-}
-
-/// A routing target: a named model an algorithm can call. Implemented by
-/// [`LlmTarget`] (the value type hosts build) and [`WrappedLlmTarget`] (the
-/// offload-capable wrapper the orchestrator applies internally).
-#[async_trait]
-pub trait LlmTargetI: Send + Sync {
-    /// The target's name — usually the upstream model id an algorithm routes to.
-    fn get_name(&self) -> &str;
-    /// The client that serves this target's calls, or `None` if calls are offloaded.
-    fn get_client(&self) -> Option<Arc<dyn LlmClient>>;
-    /// Whether this target can serve its own call (has a client). Used by
-    /// [`LlmTargetSet::all_have_clients`] to decide if `orchestrate_direct` is safe.
-    fn has_client(&self) -> bool {
-        self.get_client().is_some()
-    }
-    /// Perform (or offload) the model call, tagging it with the algorithm's
-    /// `decision` so a host driving the stream can see *why* the call was made.
-    async fn call(
-        &self,
-        request: OrchestratorRequest,
-        decision: Option<Arc<dyn DecisionTrace>>,
     ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>>;
 }
 
 /// A named routing target, optionally backed by an [`LlmClient`].
 ///
-/// With a client, [`call`](LlmTargetI::call) invokes it directly. Without one,
-/// `call` errors *unless* the target has been wrapped by
-/// [`MultiLlmOrchestrator::new`] (as a [`WrappedLlmTarget`]), which turns a
-/// client-less call into an offloaded promise.
+/// An algorithm selects a target by its [`name`](Self::name) and calls it. With a
+/// client, [`call`](Self::call) invokes it directly. Without one, `call` offloads
+/// to the promise channel in the [`OrchestratorContext`] it is given — which exists
+/// only inside an [`orchestrate`](MultiLlmOrchestrator::orchestrate) run; a
+/// client-less call made with a channel-less context (e.g. `orchestrate_direct`)
+/// errors.
 #[derive(Clone)]
 pub struct LlmTarget {
-    /// The target/model name.
+    /// The routing name an algorithm selects this target by (a logical tier like
+    /// `"strong"`, or the model id when they coincide).
     pub name: String,
+    /// The provider model id the client actually calls (e.g. `"openai/gpt-4o"`).
+    /// Set equal to `name` when the routing label *is* the model id.
+    pub model: String,
     /// The client that serves calls, or `None` to offload them.
     pub llm_client: Option<Arc<dyn LlmClient>>,
 }
 
-#[async_trait]
-impl LlmTargetI for LlmTarget {
-    fn get_name(&self) -> &str {
-        &self.name
-    }
-    fn get_client(&self) -> Option<Arc<dyn LlmClient>> {
-        self.llm_client.clone()
+impl LlmTarget {
+    /// Whether this target can serve its own call (has a client). Used by
+    /// [`LlmTargetSet::all_have_clients`] to decide if `orchestrate_direct` is safe.
+    pub fn has_client(&self) -> bool {
+        self.llm_client.is_some()
     }
 
-    async fn call(
+    /// Perform (or offload) the model call, tagging it with the algorithm's
+    /// `decision` so a host driving the stream can see *why* the call was made.
+    ///
+    /// A client-backed target serves the call directly; a client-less one offloads
+    /// via `ctx`'s promise channel. An algorithm gets `ctx` from its
+    /// `process_request` and passes it straight through.
+    pub async fn call(
         &self,
-        request: OrchestratorRequest,
-        _decision: Option<Arc<dyn DecisionTrace>>,
-    ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-        match &self.llm_client {
-            Some(client) => client.call(request, Some(self.name.clone())).await,
-            None => Err(format!("No LLM client for target {}", self.name).into()),
-        }
-    }
-}
-
-tokio::task_local! {
-    /// The current request's promise sender, set by `orchestrate` in the task
-    /// scope around `process_request`. A wrapped target routes an offloaded call
-    /// to *this* channel, so concurrent requests never share a promise channel —
-    /// which is what lets many requests be orchestrated in parallel.
-    static PROMISE_TX: tokio::sync::mpsc::Sender<LlmPromiseTx>;
-}
-
-/// A target that offloads calls it cannot serve directly. With no client, `call`
-/// makes a promise and hands it to the current request's promise channel (the
-/// `PROMISE_TX` task-local); the orchestrator surfaces it as a `CallLlm` step for
-/// the caller to fulfill.
-pub struct WrappedLlmTarget {
-    target: LlmTarget,
-}
-
-#[async_trait]
-impl LlmTargetI for WrappedLlmTarget {
-    fn get_name(&self) -> &str {
-        self.target.get_name()
-    }
-
-    fn get_client(&self) -> Option<Arc<dyn LlmClient>> {
-        self.target.get_client()
-    }
-
-    async fn call(
-        &self,
-        request: OrchestratorRequest,
+        ctx: &OrchestratorContext,
+        mut request: OrchestratorRequest,
         decision: Option<Arc<dyn DecisionTrace>>,
     ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-        match self.get_client() {
-            Some(client) => {
-                client
-                    .call(request, Some(self.get_name().to_string()))
-                    .await
-            }
+        // Translate the routing name into the provider model id the client (or the
+        // host fulfilling an offload) calls, so the algorithm can route by a label.
+        request.llm_request.model_name = self.model.clone();
+        match &self.llm_client {
+            Some(client) => client.call(request).await,
             None => {
-                // No direct client: offload the call via a promise on the current
-                // request's channel (task-local), attaching the decision so the
-                // orchestrator can surface it on its stream.
-                let promise_tx = PROMISE_TX
-                    .try_with(|tx| tx.clone())
-                    .map_err(|_| "offloading a target call requires an orchestrate() context")?;
+                // No client: offload via a promise on this request's channel,
+                // attaching the decision so the orchestrator can surface it on its
+                // stream. The context has no channel outside an orchestrate() run.
+                let promise_tx = ctx.promise_tx.clone().ok_or_else(|| {
+                    format!(
+                        "target '{}' has no client and no offload channel",
+                        self.name
+                    )
+                })?;
                 let (tx, mut rx) = llm_promise(request, decision);
                 promise_tx
                     .send(tx)
@@ -402,28 +373,25 @@ impl LlmTargetI for WrappedLlmTarget {
 /// or by name ([`get_target`](Self::get_target)).
 #[derive(Clone)]
 pub struct LlmTargetSet {
-    targets: Vec<Arc<dyn LlmTargetI>>,
+    targets: Vec<LlmTarget>,
 }
 
 impl LlmTargetSet {
     /// Build a target set from a list of targets.
-    pub fn new(targets: Vec<Arc<dyn LlmTargetI>>) -> Self {
+    pub fn new(targets: Vec<LlmTarget>) -> Self {
         Self { targets }
     }
 
     /// All targets in the set — e.g. for an algorithm to select among.
-    pub fn targets(&self) -> &[Arc<dyn LlmTargetI>] {
+    pub fn targets(&self) -> &[LlmTarget] {
         &self.targets
     }
 
     /// Look up a target by name; errors if no target has that name.
-    pub fn get_target(
-        &self,
-        name: &str,
-    ) -> Result<Arc<dyn LlmTargetI>, Box<dyn Error + Send + Sync>> {
+    pub fn get_target(&self, name: &str) -> Result<LlmTarget, Box<dyn Error + Send + Sync>> {
         self.targets
             .iter()
-            .find(|t| t.get_name() == name)
+            .find(|t| t.name == name)
             .cloned()
             .ok_or(format!("Target {} not found", name).into())
     }
@@ -436,7 +404,7 @@ impl LlmTargetSet {
 }
 
 /// A stateful optimization algorithm. `process_request` is called once per
-/// request; inside it the algorithm makes as many `LlmTargetI::call`s as it needs
+/// request; inside it the algorithm makes as many `LlmTarget::call`s as it needs
 /// (each may be served directly or offloaded), and returns a decision trace plus
 /// the final response. `process_signals` feeds it agentic-stack events.
 ///
@@ -449,10 +417,13 @@ impl LlmTargetSet {
 #[async_trait]
 pub trait OrchAlgo: Send + Sync {
     /// Run one request to completion: make the model calls the algorithm decides
-    /// on (via [`LlmTargetI::call`]) and return the decision trace plus the final
-    /// response. Called concurrently for many requests, so it takes `&self`.
+    /// on (via [`LlmTarget::call`]) and return the decision trace plus the final
+    /// response. Called concurrently for many requests, so it takes `&self`. Pass
+    /// `ctx` straight through to every [`LlmTarget::call`] — it carries the
+    /// per-request offload channel; the algorithm never inspects it.
     async fn process_request(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>;
     /// Feed the algorithm agentic-stack events (tool results, budgets, etc.). The
@@ -464,12 +435,12 @@ pub trait OrchAlgo: Send + Sync {
     ) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
-/// Builds an [`OrchAlgo`] once its target set is known. The orchestrator wraps
-/// the targets (to route offloaded calls to its promise channel) before handing
-/// them to the builder, so an algorithm never constructs its own targets.
+/// Builds an [`OrchAlgo`] once its target set is known. [`MultiLlmOrchestrator::new`]
+/// hands the target set to the builder, so an algorithm never constructs its own
+/// targets.
 pub trait OrchAlgoBuilder: Send + Sync {
-    /// Supply the (wrapped) target set the built algorithm should route among.
-    /// Called by [`MultiLlmOrchestrator::new`] before [`build`](Self::build).
+    /// Supply the target set the built algorithm should route among. Called by
+    /// [`MultiLlmOrchestrator::new`] before [`build`](Self::build).
     fn with_target_set(&mut self, target_set: LlmTargetSet);
     /// Construct the algorithm. Called once, after `with_target_set`.
     fn build(&mut self) -> Box<dyn OrchAlgo>;
@@ -490,21 +461,10 @@ pub struct MultiLlmOrchestrator {
 
 impl MultiLlmOrchestrator {
     /// Build an orchestrator from an algorithm `builder` and an optional target
-    /// set. Each target is wrapped so a client-less call offloads to the current
-    /// request's promise channel, then the wrapped set is handed to the builder.
+    /// set. The target set is handed to the builder, which builds the algorithm;
+    /// offloading is wired per request by the [`OrchestratorContext`], not here.
     pub fn new(mut builder: Box<dyn OrchAlgoBuilder>, target_set: Option<LlmTargetSet>) -> Self {
-        let mut wrapped_targets = Vec::new();
-        for target in target_set.unwrap_or(LlmTargetSet::new(vec![])).targets {
-            let wrapped_target = WrappedLlmTarget {
-                target: LlmTarget {
-                    name: target.get_name().to_string(),
-                    llm_client: target.get_client(),
-                },
-            };
-            wrapped_targets.push(Arc::new(wrapped_target) as Arc<dyn LlmTargetI>);
-        }
-
-        let target_set = LlmTargetSet::new(wrapped_targets);
+        let target_set = target_set.unwrap_or_else(|| LlmTargetSet::new(vec![]));
         builder.with_target_set(target_set.clone());
         let algo: Arc<dyn OrchAlgo> = Arc::from(builder.build());
         MultiLlmOrchestrator { algo, target_set }
@@ -523,24 +483,26 @@ impl MultiLlmOrchestrator {
         request: OrchestratorRequest,
     ) -> impl futures::stream::Stream<Item = OrchestratorStepResult> {
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(10);
-        // Per-request promise channel: concurrent requests get independent channels
-        // (via the PROMISE_TX task-local), so offloaded promises never cross between
-        // requests. Nothing here is shared or locked, so many `orchestrate` calls
-        // run in parallel.
+        // Per-request promise channel, carried in a fresh context: concurrent
+        // requests get independent channels, so offloaded promises never cross
+        // between requests. Nothing here is shared or locked, so many `orchestrate`
+        // calls run in parallel.
         let (promise_tx, mut promise_rx) = tokio::sync::mpsc::channel::<LlmPromiseTx>(10);
+        let ctx = OrchestratorContext {
+            promise_tx: Some(promise_tx),
+        };
         let algo = self.algo.clone();
 
         // One driver task races two things: forwarding each offloaded promise to
         // the caller as a `CallLlm` step, and the algorithm finishing (which
         // yields the final `ReturnToAgent`). `process_request` runs on its own task
-        // — inside the PROMISE_TX scope so its wrapped targets offload to *this*
-        // request's channel — because it blocks awaiting promise responses the
-        // caller only produces after it receives the `CallLlm` step; the two must
-        // run concurrently, so a single receiver-loop cannot do both.
+        // — owning `ctx` so its targets offload to *this* request's channel —
+        // because it blocks awaiting promise responses the caller only produces
+        // after it receives the `CallLlm` step; the two must run concurrently, so a
+        // single receiver-loop cannot do both.
         tokio::spawn(async move {
-            let mut algo_handle = tokio::spawn(PROMISE_TX.scope(promise_tx, async move {
-                algo.process_request(request).await
-            }));
+            let mut algo_handle =
+                tokio::spawn(async move { algo.process_request(&ctx, request).await });
 
             let mut recv_closed = false;
             loop {
@@ -579,8 +541,8 @@ impl MultiLlmOrchestrator {
 
     /// Run a request without the stream: run the algorithm and return its decision
     /// trace plus the final response. Only valid when every target has a client —
-    /// otherwise the algorithm may offload a call (there is no `orchestrate` task
-    /// scope here, so a promise would have nowhere to go), so this errors up front.
+    /// otherwise the algorithm may offload a call, and the channel-less context used
+    /// here gives a promise nowhere to go, so this errors up front.
     pub async fn orchestrate_direct(
         &self,
         request: OrchestratorRequest,
@@ -593,8 +555,11 @@ impl MultiLlmOrchestrator {
             );
         }
         // All targets have clients, so the algorithm never offloads a call. Run it
-        // directly (no lock — `process_request` takes `&self`) and return.
-        self.algo.process_request(request).await
+        // directly (no lock — `process_request` takes `&self`) with a channel-less
+        // context, since no offload can occur.
+        self.algo
+            .process_request(&OrchestratorContext::default(), request)
+            .await
     }
 
     /// Feed agentic-stack signals to the algorithm (see [`OrchAlgo::process_signals`]).
@@ -618,12 +583,12 @@ mod tests {
     impl LlmClient for EchoClient {
         async fn call(
             &self,
-            _request: OrchestratorRequest,
-            model_name: Option<String>,
+            request: OrchestratorRequest,
         ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+            // Echo back the model the algorithm routed to (the target's name).
             Ok(OrchestratorResponse {
                 llm_response: LlmResponse {
-                    completion: model_name.unwrap_or_default(),
+                    completion: request.llm_request.model_name,
                     raw_response: None,
                 },
                 metadata: None,
@@ -657,6 +622,7 @@ mod tests {
     impl OrchAlgo for TestAlgo {
         async fn process_request(
             &self,
+            ctx: &OrchestratorContext,
             request: OrchestratorRequest,
         ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
         {
@@ -667,9 +633,9 @@ mod tests {
                 .ok_or("no targets")?
                 .clone();
             let decision: Arc<dyn DecisionTrace> = Arc::new(TestDecision {
-                model: target.get_name().to_string(),
+                model: target.name.clone(),
             });
-            let response = target.call(request, Some(decision.clone())).await?;
+            let response = target.call(ctx, request, Some(decision.clone())).await?;
             Ok((vec![decision], response))
         }
 
@@ -715,11 +681,10 @@ mod tests {
     fn target_set(names: &[(&str, bool)]) -> LlmTargetSet {
         let targets = names
             .iter()
-            .map(|(name, has_client)| {
-                Arc::new(LlmTarget {
-                    name: name.to_string(),
-                    llm_client: has_client.then(|| Arc::new(EchoClient) as Arc<dyn LlmClient>),
-                }) as Arc<dyn LlmTargetI>
+            .map(|(name, has_client)| LlmTarget {
+                name: name.to_string(),
+                model: name.to_string(),
+                llm_client: has_client.then(|| Arc::new(EchoClient) as Arc<dyn LlmClient>),
             })
             .collect();
         LlmTargetSet::new(targets)
@@ -862,13 +827,12 @@ mod tests {
         impl LlmClient for BarrierClient {
             async fn call(
                 &self,
-                _request: OrchestratorRequest,
-                model_name: Option<String>,
+                request: OrchestratorRequest,
             ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
                 self.barrier.wait().await;
                 Ok(OrchestratorResponse {
                     llm_response: LlmResponse {
-                        completion: model_name.unwrap_or_default(),
+                        completion: request.llm_request.model_name,
                         raw_response: None,
                     },
                     metadata: None,
@@ -877,12 +841,13 @@ mod tests {
         }
 
         let barrier = Arc::new(Barrier::new(N));
-        let targets = LlmTargetSet::new(vec![Arc::new(LlmTarget {
+        let targets = LlmTargetSet::new(vec![LlmTarget {
             name: "m".to_string(),
+            model: "m".to_string(),
             llm_client: Some(Arc::new(BarrierClient {
                 barrier: barrier.clone(),
             })),
-        }) as Arc<dyn LlmTargetI>]);
+        }]);
         // One orchestrator shared (by `&`) across many concurrent requests.
         let orch = Arc::new(MultiLlmOrchestrator::new(
             Box::new(TestBuilder::default()),

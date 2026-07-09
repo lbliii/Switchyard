@@ -15,7 +15,8 @@ An `OrchAlgo` is run once per request and makes as many normal-looking `target.c
 pub trait OrchAlgo: Send + Sync {
     // Makes target.call()s, returns a decision trace + the final response.
     // `&self` (not `&mut self`): one algorithm serves many requests concurrently.
-    async fn process_request(&self, request: OrchestratorRequest)
+    // `ctx` carries this request's offload channel; thread it into each target.call.
+    async fn process_request(&self, ctx: &OrchestratorContext, request: OrchestratorRequest)
         -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>;
     async fn process_signals(&self, signals: AgentSysSignals)
         -> Result<(), Box<dyn Error + Send + Sync>>;
@@ -31,18 +32,24 @@ pub enum OrchestratorStep {
 ## Targets: serve or offload
 
 ```rust
-#[async_trait]
-pub trait LlmTargetI: Send + Sync {
-    fn get_name(&self) -> &str;
-    fn get_client(&self) -> Option<Arc<dyn LlmClient>>;
-    async fn call(&self, request: OrchestratorRequest, decision: Option<Arc<dyn DecisionTrace>>)
-        -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>>;
+pub struct LlmTarget {
+    pub name: String,                           // routing label the algorithm selects by ("strong")
+    pub model: String,                          // provider model id the client calls ("openai/gpt-4o")
+    pub llm_client: Option<Arc<dyn LlmClient>>, // `None` -> the call is offloaded
+}
+
+impl LlmTarget {
+    // `ctx` carries the per-request offload channel a client-less target uses.
+    pub async fn call(&self, ctx: &OrchestratorContext, request: OrchestratorRequest,
+                      decision: Option<Arc<dyn DecisionTrace>>)
+        -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> { /* serve or offload */ }
 }
 ```
 
 - `LlmTarget` **with** a client serves its own call.
-- `LlmTarget` **without** a client is offloaded (via `WrappedLlmTarget`): the orchestrator surfaces
-  a `CallLlm` promise the caller fulfills. The algorithm sees a plain response either way.
+- `LlmTarget` **without** a client is offloaded: it hands a promise to the per-request
+  `OrchestratorContext`'s channel, which the orchestrator surfaces as a `CallLlm` step the caller
+  fulfills. The algorithm sees a plain response either way.
 
 ## Decisions are trait objects (not a generic)
 
@@ -86,7 +93,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
 }
 ```
 
-Build it with an `OrchAlgoBuilder`; the orchestrator wraps the targets and hands them to `build`:
+Build it with an `OrchAlgoBuilder`; the orchestrator hands the target set to `build`:
 
 ```rust
 pub trait OrchAlgoBuilder: Send + Sync {
@@ -135,7 +142,7 @@ Both usages above take a target set. Implement `LlmClient` over your transport, 
 `LlmTarget`, and collect them into an `LlmTargetSet` for an algorithm to route among:
 
 ```rust
-use libsy::{LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, LlmTargetSet,
+use libsy::{LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet,
             OrchestratorRequest, OrchestratorResponse};
 use std::sync::Arc;
 
@@ -144,9 +151,9 @@ struct MyClient { http: reqwest::Client, base_url: String, api_key: String }
 
 #[async_trait::async_trait]
 impl LlmClient for MyClient {
-    async fn call(&self, request: OrchestratorRequest, model_name: Option<String>)
+    async fn call(&self, request: OrchestratorRequest)
         -> Result<OrchestratorResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let model = model_name.unwrap_or(request.llm_request.model_name);
+        let model = request.llm_request.model_name;   // the provider id, stamped by the target
         // POST {base_url}/chat/completions with { model, messages:[{user, prompt}] } ...
         let completion = /* extract the assistant text */;
         Ok(OrchestratorResponse {
@@ -157,14 +164,20 @@ impl LlmClient for MyClient {
 }
 
 // 2. One client, shared by every target that hits the same endpoint.
+// `name` is the label an algorithm routes by; `model` is the provider id the
+// client actually calls. They can differ ("strong" -> "openai/gpt-4o") or coincide.
 let client = Arc::new(MyClient { /* .. */ }) as Arc<dyn LlmClient>;
-let target = |name: &str| Arc::new(LlmTarget {
+let target = |name: &str, model: &str| LlmTarget {
     name: name.to_string(),
+    model: model.to_string(),
     llm_client: Some(client.clone()),       // `None` instead -> the call is offloaded
-}) as Arc<dyn LlmTargetI>;
+};
 
-// 3. The set an algorithm routes among (names are the model ids it selects by).
-let targets = LlmTargetSet::new(vec![ target("gpt-4o"), target("gpt-4o-mini") ]);
+// 3. The set an algorithm routes among (it selects targets by `name`).
+let targets = LlmTargetSet::new(vec![
+    target("strong", "openai/gpt-4o"),
+    target("weak", "openai/gpt-4o-mini"),
+]);
 ```
 
 ## A built-in client: `SwitchyardClient` (planned, optional feature)
@@ -190,12 +203,16 @@ let client = Arc::new(
     SwitchyardClient::openai("https://api.openai.com/v1", std::env::var("OPENAI_API_KEY")?)
 ) as Arc<dyn LlmClient>;
 
-let target = |name: &str| Arc::new(LlmTarget {
+let target = |name: &str, model: &str| LlmTarget {
     name: name.to_string(),
+    model: model.to_string(),
     llm_client: Some(client.clone()),
-}) as Arc<dyn LlmTargetI>;
+};
 
-let targets = LlmTargetSet::new(vec![ target("gpt-4o"), target("gpt-4o-mini") ]);
+let targets = LlmTargetSet::new(vec![
+    target("strong", "openai/gpt-4o"),
+    target("weak", "openai/gpt-4o-mini"),
+]);
 ```
 
 ## Not yet built

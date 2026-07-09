@@ -26,7 +26,7 @@ use async_trait::async_trait;
 
 use crate::{
     AgentSysSignals, DecisionTrace, LlmRequest, LlmTargetSet, OrchAlgo, OrchAlgoBuilder,
-    OrchestratorRequest, OrchestratorResponse,
+    OrchestratorContext, OrchestratorRequest, OrchestratorResponse,
 };
 
 /// Which step of the ensemble flow produced a decision.
@@ -171,6 +171,7 @@ impl EnsembleOrchAlgo {
     /// Route a request to a single already-chosen model — the committed fast path.
     async fn route_committed(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
         model: String,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
@@ -192,7 +193,7 @@ impl EnsembleOrchAlgo {
             raw_request: request.raw_request,
             metadata: request.metadata,
         };
-        let response = target.call(routed, Some(decision.clone())).await?;
+        let response = target.call(ctx, routed, Some(decision.clone())).await?;
         Ok((vec![decision], response))
     }
 
@@ -200,6 +201,7 @@ impl EnsembleOrchAlgo {
     /// tally the winner, and return its response.
     async fn ensemble_turn(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
     {
@@ -227,7 +229,8 @@ impl EnsembleOrchAlgo {
                 metadata: request.metadata.clone(),
             };
             let model = model.clone();
-            calls.push(async move { (model, target.call(call_request, Some(decision)).await) });
+            calls
+                .push(async move { (model, target.call(ctx, call_request, Some(decision)).await) });
         }
         let results = futures::future::join_all(calls).await;
 
@@ -267,7 +270,7 @@ impl EnsembleOrchAlgo {
                 metadata: request.metadata.clone(),
             };
             let judge_response = judge_target
-                .call(judge_request, Some(judge_decision.clone()))
+                .call(ctx, judge_request, Some(judge_decision.clone()))
                 .await?;
             // Fail open: an unparseable pick falls back to the first response.
             let choice = parse_choice(&judge_response.llm_response.completion, survivors.len());
@@ -350,15 +353,16 @@ fn parse_choice(completion: &str, count: usize) -> usize {
 impl OrchAlgo for EnsembleOrchAlgo {
     async fn process_request(
         &self,
+        ctx: &OrchestratorContext,
         request: OrchestratorRequest,
     ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
     {
         // Fast path: exploration is over — route straight to the committed model.
         if let Some(model) = self.resolve_committed()? {
-            return self.route_committed(request, model).await;
+            return self.route_committed(ctx, request, model).await;
         }
         // Otherwise run a full ensemble turn.
-        self.ensemble_turn(request).await
+        self.ensemble_turn(ctx, request).await
     }
 
     async fn process_signals(
@@ -419,7 +423,7 @@ impl OrchAlgoBuilder for EnsembleOrchAlgoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
     use std::sync::Mutex as StdMutex;
 
     /// Mock client that answers candidate calls with `answer from {model}` and,
@@ -437,9 +441,8 @@ mod tests {
         async fn call(
             &self,
             request: OrchestratorRequest,
-            model_name: Option<String>,
         ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-            let name = model_name.unwrap_or_default();
+            let name = request.llm_request.model_name.clone();
             self.calls
                 .lock()
                 .map_err(|_| "lock poisoned")?
@@ -450,7 +453,10 @@ mod tests {
                 format!("answer from {name}")
             };
             Ok(OrchestratorResponse {
-                llm_response: LlmResponse { completion },
+                llm_response: LlmResponse {
+                    completion,
+                    raw_response: None,
+                },
                 metadata: None,
             })
         }
@@ -488,13 +494,12 @@ mod tests {
             prefer: prefer.to_string(),
             calls: Arc::clone(&calls),
         }) as Arc<dyn LlmClient>;
-        let target = |name: &str| {
-            Arc::new(LlmTarget {
-                name: name.to_string(),
-                llm_client: Some(client.clone()),
-            }) as Arc<dyn LlmTargetI>
+        let target = |name: &str| LlmTarget {
+            name: name.to_string(),
+            model: name.to_string(),
+            llm_client: Some(client.clone()),
         };
-        let mut targets: Vec<Arc<dyn LlmTargetI>> = candidates.iter().map(|n| target(n)).collect();
+        let mut targets: Vec<LlmTarget> = candidates.iter().map(|n| target(n)).collect();
         targets.push(target(judge));
         let algo = EnsembleOrchAlgo::new(
             candidates.iter().map(|s| s.to_string()).collect(),
@@ -513,13 +518,12 @@ mod tests {
         exploration_turns: u64,
         client: Arc<dyn LlmClient>,
     ) -> EnsembleOrchAlgo {
-        let target = |name: &str| {
-            Arc::new(LlmTarget {
-                name: name.to_string(),
-                llm_client: Some(client.clone()),
-            }) as Arc<dyn LlmTargetI>
+        let target = |name: &str| LlmTarget {
+            name: name.to_string(),
+            model: name.to_string(),
+            llm_client: Some(client.clone()),
         };
-        let mut targets: Vec<Arc<dyn LlmTargetI>> = candidates.iter().map(|n| target(n)).collect();
+        let mut targets: Vec<LlmTarget> = candidates.iter().map(|n| target(n)).collect();
         targets.push(target(judge));
         EnsembleOrchAlgo::new(
             candidates.iter().map(|s| s.to_string()).collect(),
@@ -540,6 +544,11 @@ mod tests {
         }
     }
 
+    // All test targets carry clients, so a channel-less context suffices.
+    fn ctx() -> OrchestratorContext {
+        OrchestratorContext::default()
+    }
+
     fn as_ensemble(
         d: &Arc<dyn DecisionTrace>,
     ) -> Result<&EnsembleDecision, Box<dyn Error + Send + Sync>> {
@@ -553,7 +562,7 @@ mod tests {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Judge prefers b/model; it should win and be returned.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 100);
-        let (trace, response) = algo.process_request(request("solve it")).await?;
+        let (trace, response) = algo.process_request(&ctx(), request("solve it")).await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
 
         // Both candidates and the judge were called.
@@ -580,8 +589,8 @@ mod tests {
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 2);
 
         // Two exploration turns.
-        algo.process_request(request("t1")).await?;
-        algo.process_request(request("t2")).await?;
+        algo.process_request(&ctx(), request("t1")).await?;
+        algo.process_request(&ctx(), request("t2")).await?;
         let judge_calls_after_exploration = calls
             .lock()
             .map_err(|_| "lock poisoned")?
@@ -592,7 +601,7 @@ mod tests {
 
         // Third request: committed fast path — routes straight to b/model with no
         // fan-out to a/model and no judge call.
-        let (trace, response) = algo.process_request(request("t3")).await?;
+        let (trace, response) = algo.process_request(&ctx(), request("t3")).await?;
         assert_eq!(response.llm_response.completion, "answer from b/model");
         assert_eq!(trace.len(), 1);
         let decision = as_ensemble(&trace[0])?;
@@ -610,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn single_candidate_skips_the_judge() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, calls) = algo(&["only/model"], "judge/haiku", "only/model", 100);
-        let (trace, response) = algo.process_request(request("hi")).await?;
+        let (trace, response) = algo.process_request(&ctx(), request("hi")).await?;
         assert_eq!(response.llm_response.completion, "answer from only/model");
         // No judge call for a lone candidate.
         assert!(!calls
@@ -628,7 +637,7 @@ mod tests {
         // exploration_turns == 0 keeps ensembling forever.
         let (algo, calls) = algo(&["a/model", "b/model"], "judge/haiku", "b/model", 0);
         for _ in 0..3 {
-            let (trace, _) = algo.process_request(request("x")).await?;
+            let (trace, _) = algo.process_request(&ctx(), request("x")).await?;
             // Always a full ensemble turn (never a lone Committed decision).
             assert_eq!(
                 as_ensemble(&trace[trace.len() - 1])?.phase,
@@ -657,17 +666,15 @@ mod tests {
             async fn call(
                 &self,
                 _request: OrchestratorRequest,
-                _model_name: Option<String>,
             ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
                 Err("upstream down".into())
             }
         }
         let client = Arc::new(FailingClient) as Arc<dyn LlmClient>;
-        let target = |name: &str| {
-            Arc::new(LlmTarget {
-                name: name.to_string(),
-                llm_client: Some(client.clone()),
-            }) as Arc<dyn LlmTargetI>
+        let target = |name: &str| LlmTarget {
+            name: name.to_string(),
+            model: name.to_string(),
+            llm_client: Some(client.clone()),
         };
         let algo = EnsembleOrchAlgo::new(
             vec!["a/model".to_string(), "b/model".to_string()],
@@ -679,7 +686,7 @@ mod tests {
                 target("judge/haiku"),
             ]),
         );
-        assert!(algo.process_request(request("x")).await.is_err());
+        assert!(algo.process_request(&ctx(), request("x")).await.is_err());
         Ok(())
     }
 
@@ -722,9 +729,8 @@ mod tests {
             async fn call(
                 &self,
                 request: OrchestratorRequest,
-                model_name: Option<String>,
             ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-                let name = model_name.unwrap_or_default();
+                let name = request.llm_request.model_name.clone();
                 let completion = if name == self.judge_model {
                     // Judge runs after the barrier releases; it must not wait.
                     judge_pick(&request.llm_request.prompt, &self.prefer)
@@ -734,7 +740,10 @@ mod tests {
                     format!("answer from {name}")
                 };
                 Ok(OrchestratorResponse {
-                    llm_response: LlmResponse { completion },
+                    llm_response: LlmResponse {
+                        completion,
+                        raw_response: None,
+                    },
                     metadata: None,
                 })
             }
@@ -767,7 +776,7 @@ mod tests {
         let run = |session: Arc<EnsembleOrchAlgo>, prompt: &'static str| {
             tokio::spawn(async move {
                 session
-                    .process_request(request(prompt))
+                    .process_request(&ctx(), request(prompt))
                     .await
                     .map(|(_, response)| response.llm_response.completion)
             })
@@ -798,9 +807,9 @@ mod tests {
         // request's winning model and decision phase.
         let drive = |session: Arc<EnsembleOrchAlgo>| {
             tokio::spawn(async move {
-                session.process_request(request("t1")).await?;
-                session.process_request(request("t2")).await?;
-                let (trace, response) = session.process_request(request("t3")).await?;
+                session.process_request(&ctx(), request("t1")).await?;
+                session.process_request(&ctx(), request("t2")).await?;
+                let (trace, response) = session.process_request(&ctx(), request("t3")).await?;
                 let phase = trace
                     .last()
                     .and_then(|d| d.as_any().downcast_ref::<EnsembleDecision>())

@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use libsy::llm_class::LlmClassifierOrchAlgoBuilder;
 use libsy::{
-    DecisionTrace, LlmRequest, LlmResponse, LlmTarget, LlmTargetI, LlmTargetSet,
-    MultiLlmOrchestrator, OrchestratorRequest, OrchestratorResponse, OrchestratorStep,
+    DecisionTrace, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, MultiLlmOrchestrator,
+    OrchestratorRequest, OrchestratorResponse, OrchestratorStep,
 };
 use tokio_stream::StreamExt;
 
@@ -44,11 +44,10 @@ async fn call_model(request: &OrchestratorRequest) -> OrchestratorResponse {
 
 fn targets() -> LlmTargetSet {
     // Client-less targets -> every call is offloaded via a promise.
-    let target = |name: &str| {
-        Arc::new(LlmTarget {
-            name: name.to_string(),
-            llm_client: None,
-        }) as Arc<dyn LlmTargetI>
+    let target = |name: &str| LlmTarget {
+        name: name.to_string(),
+        model: name.to_string(),
+        llm_client: None,
     };
     LlmTargetSet::new(vec![target(CLASSIFIER), target(STRONG), target(WEAK)])
 }
