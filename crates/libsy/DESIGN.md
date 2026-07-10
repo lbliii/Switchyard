@@ -115,6 +115,9 @@ builder. An algorithm selects among targets with `LlmTargetSet::targets()` / `ge
 
 ## Reference algorithms
 
+- **`AgentAwareOrchAlgo`** (`agentic.rs`) — **stateful**: normalize harness identity, classify one
+  candidate from an arbitrary model pool, and retain valid assignments per stable agent/task. A
+  classifier failure falls back for the current request but is not cached.
 - **`RandomOrchAlgo`** (`rand.rs`) — one `target.call`: pick a target uniformly at random, call it.
 - **`LlmClassifierOrchAlgo`** (`llm_class.rs`) — two `target.call`s: call the classifier target for a
   score, then call the strong/weak target. Fail-open — an unparseable score routes strong.
@@ -123,7 +126,7 @@ builder. An algorithm selects among targets with `LlmTargetSet::targets()` / `ge
   — commit to the winningest model and route straight to it. Its win tally/turn counter live behind a
   `Mutex` (interior mutability over just its own state), the pattern the `&self` contract expects.
 
-All three drive through the same orchestrator; an algorithm's extra rounds and state are its own
+All four drive through the same orchestrator; an algorithm's extra rounds and state are its own
 control flow, not orchestrator machinery.
 
 ## Examples
@@ -133,9 +136,9 @@ control flow, not orchestrator machinery.
 - **`examples/research_agent_core.rs`** — client-less targets: each call is offloaded, so the agent
   fulfills `CallLlm` promises with its own model calls. The offload/streaming path.
 - **`demo/libsy-proxy`** (workspace crate) — a real HTTP proxy: switchyard's crates serve the
-  OpenAI/Anthropic/Responses APIs and translate formats, while *all* routing is the classifier
-  algorithm; libsy's targets make their upstream calls through switchyard's backend. Shows libsy
-  embedded in a production-shaped I/O stack.
+  OpenAI/Anthropic/Responses APIs and translate formats, while *all* routing is the agent-aware
+  model-pool algorithm; libsy's targets make their upstream calls through switchyard's backend.
+  Shows libsy embedded in a production-shaped I/O stack.
 
 ## Concurrency
 

@@ -103,6 +103,34 @@ pub trait OrchAlgoBuilder: Send + Sync {
 }
 ```
 
+## Agent- and subtask-aware routing
+
+`agentic::AgentAwareOrchAlgo` classifies the first request for a stable agent/task against an
+arbitrary model pool, then reuses that assignment. This keeps child-agent context and prompt-cache
+locality on one model while allowing different child agents in the same root session to use different
+models. Invalid or failed classifier calls fall back without caching the failure.
+
+```rust
+use libsy::agentic::{AgentAwareOrchAlgoBuilder, AgentRoutingCandidate};
+
+let builder = Box::new(AgentAwareOrchAlgoBuilder::new(
+    "classifier",
+    vec![
+        AgentRoutingCandidate::new("frontier", "planning, synthesis, and review"),
+        AgentRoutingCandidate::new("fast", "bounded research and mechanical edits"),
+    ],
+    "frontier", // fail-open target
+));
+let orchestrator = MultiLlmOrchestrator::new(builder, Some(targets));
+```
+
+`metadata_from_headers` converts harness-specific identity into neutral `Metadata`. Supported inputs
+include current Codex `session-id`, `thread-id`, `x-codex-parent-thread-id`, `x-openai-subagent`, and
+`x-codex-turn-metadata`; NeMo Relay `x-nemo-relay-session-id` /
+`x-nemo-relay-subagent-id`; Dynamo `x-dynamo-session-id` /
+`x-dynamo-parent-session-id`; and explicit `x-switchyard-*` overrides. The normalizer is local
+because Relay's relevant gateway adapter is not exposed by its public Rust library API.
+
 ## Using it — self-serving targets (`orchestrate_direct`)
 
 When every target has a client, no call is ever offloaded, so there is no stream to drive. Use
