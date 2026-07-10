@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Random router built on the [`OrchAlgo`] interfaces.
+//! Random router built on the [`Algorithm`] interfaces.
 //!
 //! Selects one target from the set uniformly at random and calls it. This is the
 //! simplest possible routing algorithm and the reference for the single-call
@@ -14,10 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 
-use crate::{
-    AgentSysSignals, DecisionTrace, LlmTargetSet, OrchAlgo, OrchestratorContext,
-    OrchestratorRequest, OrchestratorResponse,
-};
+use crate::{Algorithm, Context, DecisionTrace, LlmTargetSet, Request, Response, Signals};
 
 /// Decision produced by [`RandomOrchAlgo`]: which target was chosen and why.
 pub struct RandomDecision {
@@ -47,23 +44,22 @@ pub struct RandomOrchAlgo {
 impl RandomOrchAlgo {
     /// Create a router over `target_set`. Wrap it in an
     /// [`Arc`](std::sync::Arc) and hand it to
-    /// [`MultiLlmOrchestrator::new`](crate::MultiLlmOrchestrator::new) to run it.
+    /// [`Switchyard::new`](crate::Switchyard::new) to run it.
     pub fn new(target_set: LlmTargetSet) -> Self {
         Self { target_set }
     }
 }
 
 #[async_trait]
-impl OrchAlgo for RandomOrchAlgo {
+impl Algorithm for RandomOrchAlgo {
     async fn process_request(
         &self,
-        ctx: &OrchestratorContext,
-        request: OrchestratorRequest,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
-    {
+        ctx: &Context,
+        request: Request,
+    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
         // Select a target uniformly at random. Scope the RNG so the non-Send
         // `ThreadRng` is dropped before the await below, keeping the returned
-        // future `Send` (required by the `OrchAlgo` bound).
+        // future `Send` (required by the `Algorithm` bound).
         let target = {
             let mut rng = rand::thread_rng();
             self.target_set
@@ -85,10 +81,7 @@ impl OrchAlgo for RandomOrchAlgo {
         Ok((vec![decision], response))
     }
 
-    async fn process_signals(
-        &self,
-        _signals: AgentSysSignals,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Random routing is stateless, so agent-system signals are ignored.
         Ok(())
     }
@@ -101,7 +94,7 @@ impl OrchAlgo for RandomOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
     use std::collections::HashSet;
 
     /// Echoes back the target name it was called with, so a test can tell which
@@ -110,11 +103,8 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for EchoClient {
-        async fn call(
-            &self,
-            request: OrchestratorRequest,
-        ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
-            Ok(OrchestratorResponse {
+        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
+            Ok(Response {
                 llm_response: LlmResponse {
                     completion: request.llm_request.model_name,
                     raw_response: None,
@@ -124,8 +114,8 @@ mod tests {
         }
     }
 
-    fn request() -> OrchestratorRequest {
-        OrchestratorRequest {
+    fn request() -> Request {
+        Request {
             llm_request: LlmRequest {
                 model_name: "auto".to_string(),
                 prompt: "hi".to_string(),
@@ -136,8 +126,8 @@ mod tests {
     }
 
     // Client-less-free tests: a channel-less context, since no call offloads.
-    fn ctx() -> OrchestratorContext {
-        OrchestratorContext::default()
+    fn ctx() -> Context {
+        Context::default()
     }
 
     fn algo(names: &[&str]) -> RandomOrchAlgo {
@@ -208,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn process_signals_is_a_noop() -> Result<(), Box<dyn Error + Send + Sync>> {
         let algo = algo(&["only/model"]);
-        algo.process_signals(AgentSysSignals {}).await?;
+        algo.process_signals(Signals {}).await?;
         Ok(())
     }
 

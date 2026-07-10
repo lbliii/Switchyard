@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! LLM-classifier router built on the [`OrchAlgo`] interfaces.
+//! LLM-classifier router built on the [`Algorithm`] interfaces.
 //!
 //! Unlike a local ML classifier (which scores a prompt in-process), an LLM
 //! classifier needs its own model call to classify the request. On the new
@@ -16,8 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    AgentSysSignals, DecisionTrace, LlmRequest, LlmTargetSet, OrchAlgo, OrchestratorContext,
-    OrchestratorRequest, OrchestratorResponse,
+    Algorithm, Context, DecisionTrace, LlmRequest, LlmTargetSet, Request, Response, Signals,
 };
 
 /// Preamble prepended to the user prompt when asking the classifier target for a
@@ -99,18 +98,17 @@ impl LlmClassifierOrchAlgo {
 }
 
 #[async_trait]
-impl OrchAlgo for LlmClassifierOrchAlgo {
+impl Algorithm for LlmClassifierOrchAlgo {
     async fn process_request(
         &self,
-        ctx: &OrchestratorContext,
-        request: OrchestratorRequest,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
-    {
+        ctx: &Context,
+        request: Request,
+    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
 
         // 1. Classify: call the classifier target with the score-eliciting prompt.
         let classifier_target = self.target_set.get_target(&self.classifier_model)?;
-        let classify_request = OrchestratorRequest {
+        let classify_request = Request {
             llm_request: LlmRequest {
                 model_name: self.classifier_model.clone(),
                 prompt: format!("{CLASSIFIER_PROMPT_PREAMBLE}{user_prompt}"),
@@ -151,7 +149,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
             score,
             tier: Some(tier),
         });
-        let routed_request = OrchestratorRequest {
+        let routed_request = Request {
             llm_request: LlmRequest {
                 model_name: model,
                 prompt: user_prompt,
@@ -166,10 +164,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
         Ok((vec![classify_decision, route_decision], response))
     }
 
-    async fn process_signals(
-        &self,
-        _signals: AgentSysSignals,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Stateless classification; agent-system signals are ignored.
         Ok(())
     }
@@ -182,7 +177,7 @@ impl OrchAlgo for LlmClassifierOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
     use std::sync::Mutex;
 
     /// Returns `score` for the classifier target, an answer tagged with the model
@@ -191,15 +186,12 @@ mod tests {
     struct ScoringClient {
         classifier_model: String,
         score: String,
-        seen: Arc<Mutex<Vec<OrchestratorRequest>>>,
+        seen: Arc<Mutex<Vec<Request>>>,
     }
 
     #[async_trait]
     impl LlmClient for ScoringClient {
-        async fn call(
-            &self,
-            request: OrchestratorRequest,
-        ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
             let name = request.llm_request.model_name.clone();
             let completion = if name == self.classifier_model {
                 self.score.clone()
@@ -207,7 +199,7 @@ mod tests {
                 format!("answer from {name}")
             };
             self.seen.lock().map_err(|_| "lock poisoned")?.push(request);
-            Ok(OrchestratorResponse {
+            Ok(Response {
                 llm_response: LlmResponse {
                     completion,
                     raw_response: None,
@@ -218,10 +210,7 @@ mod tests {
     }
 
     /// Build a classifier algo whose three targets share a scoring client.
-    fn algo(
-        threshold: f64,
-        score: &str,
-    ) -> (LlmClassifierOrchAlgo, Arc<Mutex<Vec<OrchestratorRequest>>>) {
+    fn algo(threshold: f64, score: &str) -> (LlmClassifierOrchAlgo, Arc<Mutex<Vec<Request>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let client = Arc::new(ScoringClient {
             classifier_model: "router/classifier".to_string(),
@@ -248,8 +237,8 @@ mod tests {
         (algo, seen)
     }
 
-    fn request(prompt: &str) -> OrchestratorRequest {
-        OrchestratorRequest {
+    fn request(prompt: &str) -> Request {
+        Request {
             llm_request: LlmRequest {
                 model_name: "auto".to_string(),
                 prompt: prompt.to_string(),
@@ -260,8 +249,8 @@ mod tests {
     }
 
     // Every test target has a client, so a channel-less context is enough.
-    fn ctx() -> OrchestratorContext {
-        OrchestratorContext::default()
+    fn ctx() -> Context {
+        Context::default()
     }
 
     /// Downcast a trace entry to the concrete classifier decision.

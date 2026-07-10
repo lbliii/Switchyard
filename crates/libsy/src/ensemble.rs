@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ensemble router built on the [`OrchAlgo`] interfaces.
+//! Ensemble router built on the [`Algorithm`] interfaces.
 //!
 //! Each request is fanned out to a set of candidate models concurrently; a judge
 //! model (e.g. Haiku) then picks the best response, which is returned to the
@@ -13,10 +13,10 @@
 //! Unlike the reference routers, this algorithm is **stateful**: the win tally,
 //! turn counter, and committed choice live behind a [`std::sync::Mutex`] so one
 //! shared `&self` can serve a session's requests concurrently (see the
-//! `OrchAlgo` docs). In a proxy setup one [`MultiLlmOrchestrator`] — and thus one
+//! `Algorithm` docs). In a proxy setup one [`Switchyard`] — and thus one
 //! `EnsembleOrchAlgo` — is created per session, so this state is per-session.
 //!
-//! [`MultiLlmOrchestrator`]: crate::MultiLlmOrchestrator
+//! [`Switchyard`]: crate::Switchyard
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -25,8 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::{
-    AgentSysSignals, DecisionTrace, LlmRequest, LlmTargetSet, OrchAlgo, OrchestratorContext,
-    OrchestratorRequest, OrchestratorResponse,
+    Algorithm, Context, DecisionTrace, LlmRequest, LlmTargetSet, Request, Response, Signals,
 };
 
 /// Which step of the ensemble flow produced a decision.
@@ -104,7 +103,7 @@ impl EnsembleOrchAlgo {
     /// exploring for `exploration_turns` before committing to the winningest
     /// candidate (`0` = never commit, ensemble every request), routing among
     /// `target_set`. Wrap it in an [`Arc`](std::sync::Arc) for
-    /// [`MultiLlmOrchestrator::new`](crate::MultiLlmOrchestrator::new).
+    /// [`Switchyard::new`](crate::Switchyard::new).
     pub fn new(
         candidate_models: Vec<String>,
         judge_model: impl Into<String>,
@@ -172,11 +171,10 @@ impl EnsembleOrchAlgo {
     /// Route a request to a single already-chosen model — the committed fast path.
     async fn route_committed(
         &self,
-        ctx: &OrchestratorContext,
-        request: OrchestratorRequest,
+        ctx: &Context,
+        request: Request,
         model: String,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
-    {
+    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
         let target = self.target_set.get_target(&model)?;
         let decision: Arc<dyn DecisionTrace> = Arc::new(EnsembleDecision {
             reasoning: format!(
@@ -186,7 +184,7 @@ impl EnsembleOrchAlgo {
             selected_model: model.clone(),
             phase: EnsemblePhase::Committed,
         });
-        let routed = OrchestratorRequest {
+        let routed = Request {
             llm_request: LlmRequest {
                 model_name: model,
                 prompt: request.llm_request.prompt,
@@ -202,10 +200,9 @@ impl EnsembleOrchAlgo {
     /// tally the winner, and return its response.
     async fn ensemble_turn(
         &self,
-        ctx: &OrchestratorContext,
-        request: OrchestratorRequest,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
-    {
+        ctx: &Context,
+        request: Request,
+    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
 
         // Fan out to all candidates concurrently with the same user prompt. Each
@@ -221,7 +218,7 @@ impl EnsembleOrchAlgo {
                 phase: EnsemblePhase::Candidate,
             });
             candidate_decisions.push(decision.clone());
-            let call_request = OrchestratorRequest {
+            let call_request = Request {
                 llm_request: LlmRequest {
                     model_name: model.clone(),
                     prompt: user_prompt.clone(),
@@ -237,7 +234,7 @@ impl EnsembleOrchAlgo {
 
         // Keep only successful responses, preserving candidate order. A failed
         // candidate is simply excluded from judging rather than failing the turn.
-        let mut survivors: Vec<(String, OrchestratorResponse)> = Vec::new();
+        let mut survivors: Vec<(String, Response)> = Vec::new();
         for (model, result) in results {
             if let Ok(response) = result {
                 survivors.push((model, response));
@@ -262,7 +259,7 @@ impl EnsembleOrchAlgo {
                 reasoning: format!("judging {} candidate responses", survivors.len()),
                 phase: EnsemblePhase::Judge,
             });
-            let judge_request = OrchestratorRequest {
+            let judge_request = Request {
                 llm_request: LlmRequest {
                     model_name: self.judge_model.clone(),
                     prompt: judge_prompt,
@@ -311,7 +308,7 @@ impl EnsembleOrchAlgo {
 
 /// Build the judge prompt. Responses are presented anonymously (no model names)
 /// so the judge scores on content alone rather than model reputation.
-fn build_judge_prompt(user_prompt: &str, survivors: &[(String, OrchestratorResponse)]) -> String {
+fn build_judge_prompt(user_prompt: &str, survivors: &[(String, Response)]) -> String {
     let mut prompt = String::from(
         "You are an impartial judge. Choose which response best answers the user request.\n\n",
     );
@@ -351,13 +348,12 @@ fn parse_choice(completion: &str, count: usize) -> usize {
 }
 
 #[async_trait]
-impl OrchAlgo for EnsembleOrchAlgo {
+impl Algorithm for EnsembleOrchAlgo {
     async fn process_request(
         &self,
-        ctx: &OrchestratorContext,
-        request: OrchestratorRequest,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>
-    {
+        ctx: &Context,
+        request: Request,
+    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
         // Fast path: exploration is over — route straight to the committed model.
         if let Some(model) = self.resolve_committed()? {
             return self.route_committed(ctx, request, model).await;
@@ -366,10 +362,7 @@ impl OrchAlgo for EnsembleOrchAlgo {
         self.ensemble_turn(ctx, request).await
     }
 
-    async fn process_signals(
-        &self,
-        _signals: AgentSysSignals,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn process_signals(&self, _signals: Signals) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Success is measured by the judge, not agent-system signals.
         Ok(())
     }
@@ -382,7 +375,7 @@ impl OrchAlgo for EnsembleOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, OrchestratorResponse};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
     use std::sync::Mutex as StdMutex;
 
     /// Mock client that answers candidate calls with `answer from {model}` and,
@@ -397,10 +390,7 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for JudgingClient {
-        async fn call(
-            &self,
-            request: OrchestratorRequest,
-        ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
             let name = request.llm_request.model_name.clone();
             self.calls
                 .lock()
@@ -411,7 +401,7 @@ mod tests {
             } else {
                 format!("answer from {name}")
             };
-            Ok(OrchestratorResponse {
+            Ok(Response {
                 llm_response: LlmResponse {
                     completion,
                     raw_response: None,
@@ -492,8 +482,8 @@ mod tests {
         )
     }
 
-    fn request(prompt: &str) -> OrchestratorRequest {
-        OrchestratorRequest {
+    fn request(prompt: &str) -> Request {
+        Request {
             llm_request: LlmRequest {
                 model_name: "auto".to_string(),
                 prompt: prompt.to_string(),
@@ -504,8 +494,8 @@ mod tests {
     }
 
     // All test targets carry clients, so a channel-less context suffices.
-    fn ctx() -> OrchestratorContext {
-        OrchestratorContext::default()
+    fn ctx() -> Context {
+        Context::default()
     }
 
     fn as_ensemble(
@@ -624,8 +614,8 @@ mod tests {
         impl LlmClient for FailingClient {
             async fn call(
                 &self,
-                _request: OrchestratorRequest,
-            ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+                _request: Request,
+            ) -> Result<Response, Box<dyn Error + Send + Sync>> {
                 Err("upstream down".into())
             }
         }
@@ -652,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn process_signals_is_a_noop() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (algo, _) = algo(&["a/model"], "judge/haiku", "a/model", 1);
-        algo.process_signals(AgentSysSignals {}).await?;
+        algo.process_signals(Signals {}).await?;
         Ok(())
     }
 
@@ -687,8 +677,8 @@ mod tests {
         impl LlmClient for BarrierClient {
             async fn call(
                 &self,
-                request: OrchestratorRequest,
-            ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+                request: Request,
+            ) -> Result<Response, Box<dyn Error + Send + Sync>> {
                 let name = request.llm_request.model_name.clone();
                 let completion = if name == self.judge_model {
                     // Judge runs after the barrier releases; it must not wait.
@@ -698,7 +688,7 @@ mod tests {
                     self.barrier.wait().await;
                     format!("answer from {name}")
                 };
-                Ok(OrchestratorResponse {
+                Ok(Response {
                     llm_response: LlmResponse {
                         completion,
                         raw_response: None,

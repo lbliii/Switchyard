@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Research agent driving the raw `orchestrate` stream with **client-less** targets.
+//! Research agent driving the raw `run` stream with **client-less** targets.
 //!
 //! With no client, every `target.call` is offloaded as a promise the orchestrator
 //! surfaces as a `CallLlm` step. The agent makes the "real" model call itself and
@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    DecisionTrace, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, MultiLlmOrchestrator,
-    OrchestratorRequest, OrchestratorResponse, OrchestratorStep,
+    DecisionTrace, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response, Step,
+    Switchyard,
 };
 use tokio_stream::StreamExt;
 
@@ -25,7 +25,7 @@ const WEAK: &str = "weak/model";
 
 /// The "real" model call the agent makes to fulfill a promise. The core never
 /// makes the call itself — it hands back a request and waits for the response.
-async fn call_model(request: &OrchestratorRequest) -> OrchestratorResponse {
+async fn call_model(request: &Request) -> Response {
     let model = &request.llm_request.model_name;
     println!("  -> model call: {model}");
     let completion = if model == CLASSIFIER {
@@ -33,7 +33,7 @@ async fn call_model(request: &OrchestratorRequest) -> OrchestratorResponse {
     } else {
         format!("answer from {model}")
     };
-    OrchestratorResponse {
+    Response {
         llm_response: LlmResponse {
             completion,
             raw_response: None,
@@ -53,7 +53,7 @@ fn targets() -> LlmTargetSet {
 }
 
 struct ResearchAgent {
-    orchestrator: MultiLlmOrchestrator,
+    orchestrator: Switchyard,
 }
 
 impl ResearchAgent {
@@ -65,7 +65,7 @@ impl ResearchAgent {
     async fn run(&mut self, question: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let mut notes = Vec::new();
         for step in self.plan(question) {
-            let request = OrchestratorRequest {
+            let request = Request {
                 llm_request: LlmRequest {
                     model_name: "auto".to_string(),
                     prompt: step,
@@ -73,18 +73,18 @@ impl ResearchAgent {
                 raw_request: None,
                 metadata: None,
             };
-            let stream = self.orchestrator.orchestrate(request);
+            let stream = self.orchestrator.run(request);
             tokio::pin!(stream);
             while let Some(update) = stream.next().await {
                 match update? {
-                    OrchestratorStep::CallLlm(promises) => {
-                        for mut promise in promises {
+                    Step::CallLlm(promises) => {
+                        for promise in promises {
                             // Perform the model call the algorithm asked for, then fulfill.
                             let response = call_model(promise.get_request()).await;
-                            promise.set_response(Ok(response)).await?;
+                            promise.respond(Ok(response)).await?;
                         }
                     }
-                    OrchestratorStep::ReturnToAgent(trace, response) => {
+                    Step::ReturnToAgent(trace, response) => {
                         print_trace(&trace);
                         notes.push(response.llm_response.completion);
                     }
@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         0.5,
         targets(),
     ));
-    let orchestrator = MultiLlmOrchestrator::new(algo);
+    let orchestrator = Switchyard::new(algo);
 
     let mut agent = ResearchAgent { orchestrator };
     println!("{}", agent.run("what is switchyard?").await?);

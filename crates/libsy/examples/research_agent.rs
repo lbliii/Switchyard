@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal research agent on `MultiLlmOrchestrator` with **client-backed** targets.
+//! Minimal research agent on `Switchyard` with **client-backed** targets.
 //!
 //! Every target owns an `LlmClient`, so no call is ever offloaded. That lets the
-//! agent use `orchestrate_direct` — one request in, the decision trace + final
+//! agent use `run_direct` — one request in, the decision trace + final
 //! response out, no stream to drive. The multi-step routing (classify -> route) happens inside the
 //! classifier algorithm; the agent never sees it. Run with:
 //!   cargo run -p libsy --example research_agent
@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet,
-    MultiLlmOrchestrator, OrchestratorRequest, OrchestratorResponse,
+    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response,
+    Switchyard,
 };
 
 const CLASSIFIER: &str = "classifier/model";
@@ -28,10 +28,7 @@ struct StubClient;
 
 #[async_trait]
 impl LlmClient for StubClient {
-    async fn call(
-        &self,
-        request: OrchestratorRequest,
-    ) -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> {
+    async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
         let model = request.llm_request.model_name.clone();
         println!("  -> model call: {model}");
         // The classifier returns a score; other models return an answer.
@@ -40,7 +37,7 @@ impl LlmClient for StubClient {
         } else {
             format!("answer from {model}")
         };
-        Ok(OrchestratorResponse {
+        Ok(Response {
             llm_response: LlmResponse {
                 completion,
                 raw_response: None,
@@ -61,7 +58,7 @@ fn targets() -> LlmTargetSet {
 }
 
 struct ResearchAgent {
-    orchestrator: MultiLlmOrchestrator,
+    orchestrator: Switchyard,
 }
 
 impl ResearchAgent {
@@ -73,7 +70,7 @@ impl ResearchAgent {
     async fn run(&self, question: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let mut notes = Vec::new();
         for step in self.plan(question) {
-            let request = OrchestratorRequest {
+            let request = Request {
                 llm_request: LlmRequest {
                     model_name: "auto".to_string(),
                     prompt: step,
@@ -83,7 +80,7 @@ impl ResearchAgent {
             };
             // Every target has a client, so nothing is offloaded: run the request
             // and get the decision trace + final response directly, no stream.
-            let (trace, response) = self.orchestrator.orchestrate_direct(request).await?;
+            let (trace, response) = self.orchestrator.run_direct(request).await?;
             print_trace(&trace);
             notes.push(response.llm_response.completion);
         }
@@ -113,7 +110,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         0.5,
         targets(),
     ));
-    let orchestrator = MultiLlmOrchestrator::new(algo);
+    let orchestrator = Switchyard::new(algo);
 
     let agent = ResearchAgent { orchestrator };
     println!("{}", agent.run("what is switchyard?").await?);

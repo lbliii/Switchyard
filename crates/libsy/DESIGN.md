@@ -16,36 +16,36 @@ fulfills. That keeps the core provider- and transport-agnostic.
 
 ## The algorithm + the orchestrator
 
-An `OrchAlgo` is called once per request; inside `process_request` it makes as many `target.call`s as
+An `Algorithm` is called once per request; inside `process_request` it makes as many `target.call`s as
 it needs (a router makes one; a classifier makes two — classify, then route) and returns a decision
 trace plus the final response.
 
 ```rust
 #[async_trait]
-pub trait OrchAlgo: Send + Sync {
+pub trait Algorithm: Send + Sync {
     // `&self`, not `&mut self`: one shared algorithm serves requests in parallel.
     // `ctx` carries this request's offload channel; the algorithm just threads it
     // through to each `target.call`.
-    async fn process_request(&self, ctx: &OrchestratorContext, request: OrchestratorRequest)
-        -> Result<(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse), Box<dyn Error + Send + Sync>>;
-    async fn process_signals(&self, signals: AgentSysSignals)
+    async fn process_request(&self, ctx: &Context, request: Request)
+        -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>>;
+    async fn process_signals(&self, signals: Signals)
         -> Result<(), Box<dyn Error + Send + Sync>>;
     fn get_target_set(&self) -> &LlmTargetSet;   // targets this algo routes among
 }
 ```
 
-A `MultiLlmOrchestrator` drives one algorithm and exposes each request as a **stream** of steps:
+A `Switchyard` drives one algorithm and exposes each request as a **stream** of steps:
 
 ```rust
-pub enum OrchestratorStep {
-    CallLlm(Vec<LlmPromiseTx>),                                        // fulfill these offloaded calls
-    ReturnToAgent(Vec<Arc<dyn DecisionTrace>>, OrchestratorResponse),  // done
+pub enum Step {
+    CallLlm(Vec<CallLlmRequest>),                                        // fulfill these offloaded calls
+    ReturnToAgent(Vec<Arc<dyn DecisionTrace>>, Response),  // done
 }
-// orchestrate(&self, request) -> impl Stream<Item = OrchestratorStepResult>
+// run(&self, request) -> impl Stream<Item = Result<Step, Box<dyn Error + Send + Sync>>>
 ```
 
 When every target has a client, no call is ever offloaded, so there is nothing to fulfill on the
-stream. `orchestrate_direct(&self, request)` is the shortcut for that case: it runs the algorithm and
+stream. `run_direct(&self, request)` is the shortcut for that case: it runs the algorithm and
 returns `Result<(decision trace, final response)>`, skipping the stream. It errors up front if any
 target lacks a client (which could otherwise offload a call that nobody fulfills, deadlocking).
 
@@ -62,9 +62,9 @@ pub struct LlmTarget {
 
 impl LlmTarget {
     // `ctx` carries the per-request offload channel a client-less target uses.
-    pub async fn call(&self, ctx: &OrchestratorContext, request: OrchestratorRequest,
+    pub async fn call(&self, ctx: &Context, request: Request,
                       decision: Option<Arc<dyn DecisionTrace>>)
-        -> Result<OrchestratorResponse, Box<dyn Error + Send + Sync>> { /* serve or offload */ }
+        -> Result<Response, Box<dyn Error + Send + Sync>> { /* serve or offload */ }
 }
 ```
 
@@ -75,9 +75,9 @@ the concrete model to hit. Name and model let routing stay abstract while the cl
 
 - **`LlmTarget` with a client** serves its own call (`LlmClient::call`).
 - **A client-less target** **offloads**: it makes a promise (`llm_promise`), sends it on the promise
-  channel carried in the per-request `OrchestratorContext`, and awaits the response. The orchestrator
+  channel carried in the per-request `Context`, and awaits the response. The orchestrator
   surfaces the promise as a `CallLlm` step; the caller performs the real model call and fulfills it
-  with `set_response(Ok(response))` — or `set_response(Err(..))` to propagate a failed call back into
+  with `respond(Ok(response))` — or `respond(Err(..))` to propagate a failed call back into
   the algorithm. To the algorithm, `target.call` just returned (or errored) — the offload is invisible.
 
 The decision the algorithm attached rides along on the promise (`get_decision`), so the stream
@@ -96,21 +96,21 @@ pub trait DecisionTrace: Send + Sync {
 }
 ```
 
-Using a trait (not a generic) keeps `OrchAlgo`, `OrchestratorStep`, and the target non-generic, and
+Using a trait (not a generic) keeps `Algorithm`, `Step`, and the target non-generic, and
 gives the consumer one uniform way to read decisions across algorithms.
 
 ## Construction
 
 ```rust
 // Each algorithm's `new` takes its config plus the target set it routes among; it
-// owns that set and exposes it via `OrchAlgo::get_target_set`.
+// owns that set and exposes it via `Algorithm::get_target_set`.
 let algo = Arc::new(LlmClassifierOrchAlgo::new(classifier, strong, weak, threshold, target_set));
-let orch = MultiLlmOrchestrator::new(algo);   // just wraps the Arc<dyn OrchAlgo>
+let orch = Switchyard::new(algo);   // just wraps the Arc<dyn Algorithm>
 ```
 
 The algorithm owns its target set and selects among targets with `LlmTargetSet::targets()` /
-`get_target(name)`. `MultiLlmOrchestrator::new` takes the constructed `Arc<dyn OrchAlgo>` directly —
-there is no builder; offloading is wired per request by the `OrchestratorContext`, not at
+`get_target(name)`. `Switchyard::new` takes the constructed `Arc<dyn Algorithm>` directly —
+there is no builder; offloading is wired per request by the `Context`, not at
 construction.
 
 ## Reference algorithms
@@ -129,7 +129,7 @@ control flow, not orchestrator machinery.
 ## Examples
 
 - **`examples/research_agent.rs`** — client-backed targets: they self-serve, so the agent uses
-  `orchestrate_direct` (one call in, the response out). The simplest usage.
+  `run_direct` (one call in, the response out). The simplest usage.
 - **`examples/research_agent_core.rs`** — client-less targets: each call is offloaded, so the agent
   fulfills `CallLlm` promises with its own model calls. The offload/streaming path.
 - **`demo/libsy-proxy`** (workspace crate) — a real HTTP proxy: switchyard's crates serve the
@@ -140,11 +140,11 @@ control flow, not orchestrator machinery.
 ## Concurrency
 
 - **Requests run in parallel.** `process_request`/`process_signals` take `&self`, and the
-  orchestrator holds one shared `Arc<dyn OrchAlgo>` with no lock, so many threads can call
-  `orchestrate` / `orchestrate_direct` at once. An algorithm is responsible for its own thread-safety
+  orchestrator holds one shared `Arc<dyn Algorithm>` with no lock, so many threads can call
+  `run` / `run_direct` at once. An algorithm is responsible for its own thread-safety
   — stateless (like the reference routers), or interior mutability over just its own state.
-- **Per-request promise channel.** `orchestrate` makes a fresh channel per call and passes the sender
-  in an `OrchestratorContext` threaded (by reference) through `process_request` to each `target.call`,
+- **Per-request promise channel.** `run` makes a fresh channel per call and passes the sender
+  in an `Context` threaded (by reference) through `process_request` to each `target.call`,
   so concurrent requests never share a channel and their offloaded promises cannot cross — no global
   or task-local state.
 - `process_request` runs on its own task so it can block awaiting a promise response while the driver
@@ -153,7 +153,7 @@ control flow, not orchestrator machinery.
 
 ## Not yet built
 
-- **Signals** — `process_signals` / `AgentSysSignals` exist but carry no events yet (tool/task/budget/
+- **Signals** — `process_signals` / `Signals` exist but carry no events yet (tool/task/budget/
   telemetry).
 - **Observability** — spans + a metrics sink for token counts / timings / failures; `DecisionTrace`
   is the hook it will build on.
