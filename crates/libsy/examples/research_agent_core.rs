@@ -14,8 +14,7 @@ use std::sync::Arc;
 
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    DecisionTrace, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response, Step,
-    Switchyard,
+    Decision, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response, Step, Switchyard,
 };
 use tokio_stream::StreamExt;
 
@@ -25,8 +24,8 @@ const WEAK: &str = "weak/model";
 
 /// The "real" model call the agent makes to fulfill a promise. The core never
 /// makes the call itself — it hands back a request and waits for the response.
-async fn call_model(request: &Request) -> Response {
-    let model = &request.llm_request.model_name;
+/// The model to call is the routing decision's selection, read off the promise.
+async fn call_model(model: &str) -> Response {
     println!("  -> model call: {model}");
     let completion = if model == CLASSIFIER {
         "0.9".to_string()
@@ -45,8 +44,7 @@ async fn call_model(request: &Request) -> Response {
 fn targets() -> LlmTargetSet {
     // Client-less targets -> every call is offloaded via a promise.
     let target = |name: &str| LlmTarget {
-        name: name.to_string(),
-        model: name.to_string(),
+        semantic_name: name.to_string(),
         llm_client: None,
     };
     LlmTargetSet::new(vec![target(CLASSIFIER), target(STRONG), target(WEAK)])
@@ -67,7 +65,7 @@ impl ResearchAgent {
         for step in self.plan(question) {
             let request = Request {
                 llm_request: LlmRequest {
-                    model_name: "auto".to_string(),
+                    inbound_model_name: "auto".to_string(),
                     prompt: step,
                 },
                 raw_request: None,
@@ -80,7 +78,8 @@ impl ResearchAgent {
                     Step::CallLlm(promises) => {
                         for promise in promises {
                             // Perform the model call the algorithm asked for, then fulfill.
-                            let response = call_model(promise.get_request()).await;
+                            let response =
+                                call_model(promise.get_decision().selected_model()).await;
                             promise.respond(Ok(response)).await?;
                         }
                     }
@@ -96,11 +95,11 @@ impl ResearchAgent {
 }
 
 /// Print each decision the algorithm recorded — uniform access via the trait.
-fn print_trace(trace: &[Arc<dyn DecisionTrace>]) {
+fn print_trace(trace: &[Arc<dyn Decision>]) {
     for decision in trace {
         println!(
             "    decision: {} ({})",
-            decision.model_decision(),
+            decision.selected_model(),
             decision.reasoning().unwrap_or_default()
         );
     }

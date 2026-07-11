@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    Algorithm, Context, DecisionTrace, LlmRequest, LlmTargetSet, Request, Response, Signals,
-};
+use crate::{Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals};
 
 /// Preamble prepended to the user prompt when asking the classifier target for a
 /// strong-win-rate score.
@@ -54,8 +52,8 @@ pub struct ClassifierDecision {
     pub tier: Option<ClassifierTier>,
 }
 
-impl DecisionTrace for ClassifierDecision {
-    fn model_decision(&self) -> &str {
+impl Decision for ClassifierDecision {
+    fn selected_model(&self) -> &str {
         &self.selected_model
     }
     fn reasoning(&self) -> Option<&str> {
@@ -103,27 +101,30 @@ impl Algorithm for LlmClassifierOrchAlgo {
         &self,
         ctx: &Context,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
+        // The agent's inbound name rides through unchanged on every sub-call; the
+        // model each sub-call actually hits is carried by its decision instead.
+        let inbound = request.llm_request.inbound_model_name.clone();
 
         // 1. Classify: call the classifier target with the score-eliciting prompt.
         let classifier_target = self.target_set.get_target(&self.classifier_model)?;
         let classify_request = Request {
             llm_request: LlmRequest {
-                model_name: self.classifier_model.clone(),
+                inbound_model_name: inbound.clone(),
                 prompt: format!("{CLASSIFIER_PROMPT_PREAMBLE}{user_prompt}"),
             },
             raw_request: request.raw_request.clone(),
             metadata: request.metadata.clone(),
         };
-        let classify_decision: Arc<dyn DecisionTrace> = Arc::new(ClassifierDecision {
+        let classify_decision: Arc<dyn Decision> = Arc::new(ClassifierDecision {
             selected_model: self.classifier_model.clone(),
             reasoning: format!("classifying request via {}", self.classifier_model),
             score: None,
             tier: None,
         });
         let classify_response = classifier_target
-            .call(ctx, classify_request, Some(classify_decision.clone()))
+            .call(ctx, classify_request, classify_decision.clone())
             .await?;
         let score = classify_response
             .llm_response
@@ -139,7 +140,7 @@ impl Algorithm for LlmClassifierOrchAlgo {
             None => (ClassifierTier::Strong, self.strong_model.clone()),
         };
         let routed_target = self.target_set.get_target(&model)?;
-        let route_decision: Arc<dyn DecisionTrace> = Arc::new(ClassifierDecision {
+        let route_decision: Arc<dyn Decision> = Arc::new(ClassifierDecision {
             reasoning: format!(
                 "classifier score {score:?} vs threshold {}; selected {model} ({})",
                 self.threshold,
@@ -151,14 +152,14 @@ impl Algorithm for LlmClassifierOrchAlgo {
         });
         let routed_request = Request {
             llm_request: LlmRequest {
-                model_name: model,
+                inbound_model_name: inbound,
                 prompt: user_prompt,
             },
             raw_request: request.raw_request,
             metadata: request.metadata,
         };
         let response = routed_target
-            .call(ctx, routed_request, Some(route_decision.clone()))
+            .call(ctx, routed_request, route_decision.clone())
             .await?;
 
         Ok((vec![classify_decision, route_decision], response))
@@ -177,7 +178,7 @@ impl Algorithm for LlmClassifierOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response, RoutedRequest};
     use std::sync::Mutex;
 
     /// Returns `score` for the classifier target, an answer tagged with the model
@@ -191,14 +192,20 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for ScoringClient {
-        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
-            let name = request.llm_request.model_name.clone();
+        async fn call(
+            &self,
+            routed: RoutedRequest,
+        ) -> Result<Response, Box<dyn Error + Send + Sync>> {
+            let name = routed.decision.selected_model().to_string();
             let completion = if name == self.classifier_model {
                 self.score.clone()
             } else {
                 format!("answer from {name}")
             };
-            self.seen.lock().map_err(|_| "lock poisoned")?.push(request);
+            self.seen
+                .lock()
+                .map_err(|_| "lock poisoned")?
+                .push(routed.request);
             Ok(Response {
                 llm_response: LlmResponse {
                     completion,
@@ -218,8 +225,7 @@ mod tests {
             seen: Arc::clone(&seen),
         }) as Arc<dyn LlmClient>;
         let target = |name: &str| LlmTarget {
-            name: name.to_string(),
-            model: name.to_string(),
+            semantic_name: name.to_string(),
             llm_client: Some(client.clone()),
         };
         let target_set = LlmTargetSet::new(vec![
@@ -240,7 +246,7 @@ mod tests {
     fn request(prompt: &str) -> Request {
         Request {
             llm_request: LlmRequest {
-                model_name: "auto".to_string(),
+                inbound_model_name: "auto".to_string(),
                 prompt: prompt.to_string(),
             },
             raw_request: None,
@@ -255,7 +261,7 @@ mod tests {
 
     /// Downcast a trace entry to the concrete classifier decision.
     fn as_classifier(
-        d: &Arc<dyn DecisionTrace>,
+        d: &Arc<dyn Decision>,
     ) -> Result<&ClassifierDecision, Box<dyn Error + Send + Sync>> {
         d.as_any()
             .downcast_ref::<ClassifierDecision>()
@@ -274,7 +280,7 @@ mod tests {
             "answer from frontier/model"
         );
         // Trace: [classify, route].
-        assert_eq!(trace[0].model_decision(), "router/classifier");
+        assert_eq!(trace[0].selected_model(), "router/classifier");
         let routed = as_classifier(&trace[1])?;
         assert_eq!(routed.selected_model, "frontier/model");
         assert_eq!(routed.tier, Some(ClassifierTier::Strong));

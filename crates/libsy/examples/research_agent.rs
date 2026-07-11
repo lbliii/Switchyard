@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use libsy::llm_class::LlmClassifierOrchAlgo;
 use libsy::{
-    DecisionTrace, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response,
-    Switchyard,
+    Decision, LlmClient, LlmRequest, LlmResponse, LlmTarget, LlmTargetSet, Request, Response,
+    RoutedRequest, Switchyard,
 };
 
 const CLASSIFIER: &str = "classifier/model";
@@ -28,8 +28,9 @@ struct StubClient;
 
 #[async_trait]
 impl LlmClient for StubClient {
-    async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
-        let model = request.llm_request.model_name.clone();
+    async fn call(&self, routed: RoutedRequest) -> Result<Response, Box<dyn Error + Send + Sync>> {
+        // The model to call is the routed decision's selection, not the inbound name.
+        let model = routed.decision.selected_model().to_string();
         println!("  -> model call: {model}");
         // The classifier returns a score; other models return an answer.
         let completion = if model == CLASSIFIER {
@@ -50,8 +51,7 @@ impl LlmClient for StubClient {
 fn targets() -> LlmTargetSet {
     let client = Arc::new(StubClient) as Arc<dyn LlmClient>;
     let target = |name: &str| LlmTarget {
-        name: name.to_string(),
-        model: name.to_string(),
+        semantic_name: name.to_string(),
         llm_client: Some(client.clone()),
     };
     LlmTargetSet::new(vec![target(CLASSIFIER), target(STRONG), target(WEAK)])
@@ -72,7 +72,7 @@ impl ResearchAgent {
         for step in self.plan(question) {
             let request = Request {
                 llm_request: LlmRequest {
-                    model_name: "auto".to_string(),
+                    inbound_model_name: "auto".to_string(),
                     prompt: step,
                 },
                 raw_request: None,
@@ -89,11 +89,11 @@ impl ResearchAgent {
 }
 
 /// Print each decision the algorithm recorded — uniform access via the trait.
-fn print_trace(trace: &[Arc<dyn DecisionTrace>]) {
+fn print_trace(trace: &[Arc<dyn Decision>]) {
     for decision in trace {
         println!(
             "    decision: {} ({})",
-            decision.model_decision(),
+            decision.selected_model(),
             decision.reasoning().unwrap_or_default()
         );
     }

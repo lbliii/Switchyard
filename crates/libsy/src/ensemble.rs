@@ -24,9 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::{
-    Algorithm, Context, DecisionTrace, LlmRequest, LlmTargetSet, Request, Response, Signals,
-};
+use crate::{Algorithm, Context, Decision, LlmRequest, LlmTargetSet, Request, Response, Signals};
 
 /// Which step of the ensemble flow produced a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +62,8 @@ pub struct EnsembleDecision {
     pub phase: EnsemblePhase,
 }
 
-impl DecisionTrace for EnsembleDecision {
-    fn model_decision(&self) -> &str {
+impl Decision for EnsembleDecision {
+    fn selected_model(&self) -> &str {
         &self.selected_model
     }
     fn reasoning(&self) -> Option<&str> {
@@ -174,9 +172,9 @@ impl EnsembleOrchAlgo {
         ctx: &Context,
         request: Request,
         model: String,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         let target = self.target_set.get_target(&model)?;
-        let decision: Arc<dyn DecisionTrace> = Arc::new(EnsembleDecision {
+        let decision: Arc<dyn Decision> = Arc::new(EnsembleDecision {
             reasoning: format!(
                 "committed to '{model}' after {} turns",
                 self.exploration_turns
@@ -186,13 +184,15 @@ impl EnsembleOrchAlgo {
         });
         let routed = Request {
             llm_request: LlmRequest {
-                model_name: model,
+                // The agent's inbound name rides through; the committed model is on
+                // the decision, not stamped onto the request.
+                inbound_model_name: request.llm_request.inbound_model_name,
                 prompt: request.llm_request.prompt,
             },
             raw_request: request.raw_request,
             metadata: request.metadata,
         };
-        let response = target.call(ctx, routed, Some(decision.clone())).await?;
+        let response = target.call(ctx, routed, decision.clone()).await?;
         Ok((vec![decision], response))
     }
 
@@ -202,17 +202,20 @@ impl EnsembleOrchAlgo {
         &self,
         ctx: &Context,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         let user_prompt = request.llm_request.prompt.clone();
+        // The agent's inbound name rides through every sub-call unchanged; the model
+        // each call hits is carried by its decision, not stamped onto the request.
+        let inbound = request.llm_request.inbound_model_name.clone();
 
         // Fan out to all candidates concurrently with the same user prompt. Each
         // call is annotated with its own candidate decision so the caller can see
         // which model an offloaded call targets.
-        let mut candidate_decisions: Vec<Arc<dyn DecisionTrace>> = Vec::new();
+        let mut candidate_decisions: Vec<Arc<dyn Decision>> = Vec::new();
         let mut calls = Vec::new();
         for model in &self.candidate_models {
             let target = self.target_set.get_target(model)?;
-            let decision: Arc<dyn DecisionTrace> = Arc::new(EnsembleDecision {
+            let decision: Arc<dyn Decision> = Arc::new(EnsembleDecision {
                 selected_model: model.clone(),
                 reasoning: format!("ensemble candidate '{model}'"),
                 phase: EnsemblePhase::Candidate,
@@ -220,15 +223,14 @@ impl EnsembleOrchAlgo {
             candidate_decisions.push(decision.clone());
             let call_request = Request {
                 llm_request: LlmRequest {
-                    model_name: model.clone(),
+                    inbound_model_name: inbound.clone(),
                     prompt: user_prompt.clone(),
                 },
                 raw_request: request.raw_request.clone(),
                 metadata: request.metadata.clone(),
             };
             let model = model.clone();
-            calls
-                .push(async move { (model, target.call(ctx, call_request, Some(decision)).await) });
+            calls.push(async move { (model, target.call(ctx, call_request, decision).await) });
         }
         let results = futures::future::join_all(calls).await;
 
@@ -254,21 +256,21 @@ impl EnsembleOrchAlgo {
         } else {
             let judge_prompt = build_judge_prompt(&user_prompt, &survivors);
             let judge_target = self.target_set.get_target(&self.judge_model)?;
-            let judge_decision: Arc<dyn DecisionTrace> = Arc::new(EnsembleDecision {
+            let judge_decision: Arc<dyn Decision> = Arc::new(EnsembleDecision {
                 selected_model: self.judge_model.clone(),
                 reasoning: format!("judging {} candidate responses", survivors.len()),
                 phase: EnsemblePhase::Judge,
             });
             let judge_request = Request {
                 llm_request: LlmRequest {
-                    model_name: self.judge_model.clone(),
+                    inbound_model_name: inbound.clone(),
                     prompt: judge_prompt,
                 },
                 raw_request: request.raw_request.clone(),
                 metadata: request.metadata.clone(),
             };
             let judge_response = judge_target
-                .call(ctx, judge_request, Some(judge_decision.clone()))
+                .call(ctx, judge_request, judge_decision.clone())
                 .await?;
             // Fail open: an unparseable pick falls back to the first response.
             let choice = parse_choice(&judge_response.llm_response.completion, survivors.len());
@@ -290,7 +292,7 @@ impl EnsembleOrchAlgo {
             state.turns += 1;
         }
 
-        let winner_decision: Arc<dyn DecisionTrace> = Arc::new(EnsembleDecision {
+        let winner_decision: Arc<dyn Decision> = Arc::new(EnsembleDecision {
             reasoning: format!("judge selected '{winner_model}' as best response"),
             selected_model: winner_model,
             phase: EnsemblePhase::Winner,
@@ -353,7 +355,7 @@ impl Algorithm for EnsembleOrchAlgo {
         &self,
         ctx: &Context,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         // Fast path: exploration is over — route straight to the committed model.
         if let Some(model) = self.resolve_committed()? {
             return self.route_committed(ctx, request, model).await;
@@ -375,7 +377,7 @@ impl Algorithm for EnsembleOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response, RoutedRequest};
     use std::sync::Mutex as StdMutex;
 
     /// Mock client that answers candidate calls with `answer from {model}` and,
@@ -390,14 +392,17 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for JudgingClient {
-        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
-            let name = request.llm_request.model_name.clone();
+        async fn call(
+            &self,
+            routed: RoutedRequest,
+        ) -> Result<Response, Box<dyn Error + Send + Sync>> {
+            let name = routed.decision.selected_model().to_string();
             self.calls
                 .lock()
                 .map_err(|_| "lock poisoned")?
                 .push(name.clone());
             let completion = if name == self.judge_model {
-                judge_pick(&request.llm_request.prompt, &self.prefer)
+                judge_pick(&routed.request.llm_request.prompt, &self.prefer)
             } else {
                 format!("answer from {name}")
             };
@@ -444,8 +449,7 @@ mod tests {
             calls: Arc::clone(&calls),
         }) as Arc<dyn LlmClient>;
         let target = |name: &str| LlmTarget {
-            name: name.to_string(),
-            model: name.to_string(),
+            semantic_name: name.to_string(),
             llm_client: Some(client.clone()),
         };
         let mut targets: Vec<LlmTarget> = candidates.iter().map(|n| target(n)).collect();
@@ -468,8 +472,7 @@ mod tests {
         client: Arc<dyn LlmClient>,
     ) -> EnsembleOrchAlgo {
         let target = |name: &str| LlmTarget {
-            name: name.to_string(),
-            model: name.to_string(),
+            semantic_name: name.to_string(),
             llm_client: Some(client.clone()),
         };
         let mut targets: Vec<LlmTarget> = candidates.iter().map(|n| target(n)).collect();
@@ -485,7 +488,7 @@ mod tests {
     fn request(prompt: &str) -> Request {
         Request {
             llm_request: LlmRequest {
-                model_name: "auto".to_string(),
+                inbound_model_name: "auto".to_string(),
                 prompt: prompt.to_string(),
             },
             raw_request: None,
@@ -499,7 +502,7 @@ mod tests {
     }
 
     fn as_ensemble(
-        d: &Arc<dyn DecisionTrace>,
+        d: &Arc<dyn Decision>,
     ) -> Result<&EnsembleDecision, Box<dyn Error + Send + Sync>> {
         d.as_any()
             .downcast_ref::<EnsembleDecision>()
@@ -614,15 +617,14 @@ mod tests {
         impl LlmClient for FailingClient {
             async fn call(
                 &self,
-                _request: Request,
+                _routed: RoutedRequest,
             ) -> Result<Response, Box<dyn Error + Send + Sync>> {
                 Err("upstream down".into())
             }
         }
         let client = Arc::new(FailingClient) as Arc<dyn LlmClient>;
         let target = |name: &str| LlmTarget {
-            name: name.to_string(),
-            model: name.to_string(),
+            semantic_name: name.to_string(),
             llm_client: Some(client.clone()),
         };
         let algo = EnsembleOrchAlgo::new(
@@ -677,12 +679,12 @@ mod tests {
         impl LlmClient for BarrierClient {
             async fn call(
                 &self,
-                request: Request,
+                routed: RoutedRequest,
             ) -> Result<Response, Box<dyn Error + Send + Sync>> {
-                let name = request.llm_request.model_name.clone();
+                let name = routed.decision.selected_model().to_string();
                 let completion = if name == self.judge_model {
                     // Judge runs after the barrier releases; it must not wait.
-                    judge_pick(&request.llm_request.prompt, &self.prefer)
+                    judge_pick(&routed.request.llm_request.prompt, &self.prefer)
                 } else {
                     // Hold every candidate call until all sessions have fanned out.
                     self.barrier.wait().await;

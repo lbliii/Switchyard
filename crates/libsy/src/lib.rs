@@ -16,9 +16,10 @@
 //!   [`process_request`](Algorithm::process_request) runs once per request and
 //!   makes as many model calls as it needs — via [`LlmTarget::call`], which look
 //!   like ordinary calls — then returns a *decision trace* (a list of
-//!   [`DecisionTrace`]) plus the final [`Response`].
-//! - An [`LlmTarget`] names a model. If it carries an [`LlmClient`] it *serves*
-//!   its own calls; if not, the call is *offloaded* to the host (see below).
+//!   [`Decision`]) plus the final [`Response`].
+//! - An [`LlmTarget`] names a routing target by its [`semantic_name`](LlmTarget::semantic_name).
+//!   If it carries an [`LlmClient`] it *serves* its own calls; if not, the call is
+//!   *offloaded* to the host (see below).
 //! - A [`Switchyard`] drives requests through one algorithm (which owns
 //!   its [`LlmTargetSet`]). Construct the algorithm, then wrap it with
 //!   [`Switchyard::new`].
@@ -85,7 +86,7 @@ pub struct Metadata {
     pub extra_metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// The neutral model request an algorithm reasons over and hands to a target.
+/// The normalized model request an algorithm reasons over and hands to a target.
 ///
 /// Deliberately minimal: a target model name and the user prompt. The full
 /// provider-shaped request (messages, params, tools) rides on
@@ -93,16 +94,16 @@ pub struct Metadata {
 #[derive(Clone)]
 pub struct LlmRequest {
     /// The model to call. Algorithms rewrite this as they route.
-    pub model_name: String,
+    pub inbound_model_name: String,
     /// The user prompt an algorithm inspects (e.g. to classify) and sends.
     pub prompt: String,
 }
 
-/// A request entering the orchestrator: the neutral [`LlmRequest`] plus the
+/// A request entering the orchestrator: the normalized [`LlmRequest`] plus the
 /// original provider payload and correlation [`Metadata`].
 #[derive(Clone)]
 pub struct Request {
-    /// The neutral request an algorithm routes.
+    /// The normalized request an algorithm routes.
     pub llm_request: LlmRequest,
     /// The original provider-shaped request body, if the host wants to forward it
     /// verbatim (e.g. a proxy preserving messages/params). libsy does not read it.
@@ -146,14 +147,29 @@ pub struct Response {
 /// inspect any algorithm's decision through this common interface without
 /// knowing the concrete type. `as_any` is the escape hatch for a consumer that
 /// *does* know the algo and wants to downcast to the concrete decision.
-pub trait DecisionTrace: Send + Sync {
+pub trait Decision: Send + Sync {
     /// The model this decision selected (e.g. the routed target's name).
-    fn model_decision(&self) -> &str;
+    fn selected_model(&self) -> &str;
     /// A human-readable explanation of the decision, for logs and traces.
     fn reasoning(&self) -> Option<&str>;
     /// Downcast handle: a consumer that knows the algorithm can recover the
     /// concrete decision type via `as_any().downcast_ref::<ConcreteDecision>()`.
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// A request paired with the routing [`Decision`] that produced it — the unit an
+/// [`LlmClient`] (or an offload host) is handed to serve.
+///
+/// The two model identifiers live in separate, unambiguous places: the model to
+/// call is [`decision.selected_model()`](Decision::selected_model), while
+/// `request.llm_request.inbound_model_name` is the *inbound* name the agent asked
+/// for (libsy never overwrites it). A client maps `selected_model()` to the
+/// provider model id it hits.
+pub struct RoutedRequest {
+    /// The request to serve; its `inbound_model_name` is the agent's original name.
+    pub request: Request,
+    /// The routing decision behind this call; `selected_model()` is the model to hit.
+    pub decision: Arc<dyn Decision>,
 }
 
 /// The host-facing half of an offloaded model call.
@@ -164,8 +180,7 @@ pub trait DecisionTrace: Send + Sync {
 /// call, and fulfills the promise with [`respond`](Self::respond). That
 /// unblocks the algorithm's [`LlmTarget::call`] on the other side.
 pub struct CallLlmRequest {
-    request: Request,
-    decision: Option<Arc<dyn DecisionTrace>>,
+    pub request: RoutedRequest,
     // Fulfilled exactly once — `respond` consumes `self` to send, so no `Option`.
     tx: oneshot::Sender<Result<Response, Box<dyn Error + Send + Sync>>>,
 }
@@ -184,12 +199,12 @@ struct CallLlmRequestRx {
 impl CallLlmRequest {
     /// The model call the host should perform to fulfill this promise.
     pub fn get_request(&self) -> &Request {
-        &self.request
+        &self.request.request
     }
 
-    /// The decision that led to this call, if the algorithm attached one.
-    pub fn get_decision(&self) -> Option<&dyn DecisionTrace> {
-        self.decision.as_deref()
+    /// The decision that led to this call — its `selected_model()` is the model to hit.
+    pub fn get_decision(&self) -> &dyn Decision {
+        self.request.decision.as_ref()
     }
 
     /// Fulfill the promise with the caller's model-call result. Pass `Err(..)` to
@@ -225,19 +240,9 @@ impl CallLlmRequestRx {
 /// handed to the host, the [`CallLlmRequestRx`] is awaited by the algorithm's target.
 /// Used internally by the offload path; exposed for algorithms/hosts that build
 /// their own offloading.
-fn llm_promise(
-    request: Request,
-    decision: Option<Arc<dyn DecisionTrace>>,
-) -> (CallLlmRequest, CallLlmRequestRx) {
+fn llm_promise(request: RoutedRequest) -> (CallLlmRequest, CallLlmRequestRx) {
     let (tx, rx) = oneshot::channel();
-    (
-        CallLlmRequest {
-            request,
-            decision,
-            tx,
-        },
-        CallLlmRequestRx { rx },
-    )
+    (CallLlmRequest { request, tx }, CallLlmRequestRx { rx })
 }
 
 /// Per-request state the orchestrator threads to each [`LlmTarget::call`].
@@ -268,7 +273,7 @@ pub enum Step {
     CallLlm(Vec<CallLlmRequest>),
     /// The algorithm finished: its decision trace and the final response. This is
     /// the last step of a successful run.
-    ReturnToAgent(Vec<Arc<dyn DecisionTrace>>, Response),
+    ReturnToAgent(Vec<Arc<dyn Decision>>, Response),
 }
 
 /// Performs the actual model call for a target. This is the one piece of I/O
@@ -277,29 +282,28 @@ pub enum Step {
 /// calls; one without offloads them (see [`Switchyard::run`]).
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// Call the model named in `request.llm_request.model_name` with the given
-    /// request, returning the model's response. An algorithm sets that name to
-    /// the target it is routing to before the call, so the client always knows
-    /// which model to hit.
-    async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>>;
+    /// Serve `routed`, returning the model's response. Call the model named by
+    /// [`routed.decision.selected_model()`](Decision::selected_model) — the target
+    /// the algorithm routed to — mapping it to whatever provider model id this
+    /// client hits. `routed.request.llm_request.inbound_model_name` is the agent's
+    /// original name, carried through for reference, not a call target.
+    async fn call(&self, request: RoutedRequest) -> Result<Response, Box<dyn Error + Send + Sync>>;
 }
 
 /// A named routing target, optionally backed by an [`LlmClient`].
 ///
-/// An algorithm selects a target by its [`name`](Self::name) and calls it. With a
-/// client, [`call`](Self::call) invokes it directly. Without one, `call` offloads
-/// to the promise channel in the [`Context`] it is given — which exists
-/// only inside an [`run`](Switchyard::run) run; a
-/// client-less call made with a channel-less context (e.g. `run_direct`)
-/// errors.
+/// An algorithm selects a target by its [`semantic_name`](Self::semantic_name) and
+/// calls it. With a client, [`call`](Self::call) invokes it directly. Without one,
+/// `call` offloads to the promise channel in the [`Context`] it is given — which
+/// exists only inside an [`run`](Switchyard::run) run; a client-less call made with
+/// a channel-less context (e.g. `run_direct`) errors.
 #[derive(Clone)]
 pub struct LlmTarget {
     /// The routing name an algorithm selects this target by (a logical tier like
-    /// `"strong"`, or the model id when they coincide).
-    pub name: String,
-    /// The provider model id the client actually calls (e.g. `"openai/gpt-4o"`).
-    /// Set equal to `name` when the routing label *is* the model id.
-    pub model: String,
+    /// `"strong"`, or the model id when they coincide). How this name maps to a
+    /// provider model id is the caller's concern — encapsulated in `llm_client`
+    /// (or the host fulfilling an offload), never in the algorithm.
+    pub semantic_name: String,
     /// The client that serves calls, or `None` to offload them.
     pub llm_client: Option<Arc<dyn LlmClient>>,
 }
@@ -320,25 +324,26 @@ impl LlmTarget {
     pub async fn call(
         &self,
         ctx: &Context,
-        mut request: Request,
-        decision: Option<Arc<dyn DecisionTrace>>,
+        request: Request,
+        decision: Arc<dyn Decision>,
     ) -> Result<Response, Box<dyn Error + Send + Sync>> {
-        // Translate the routing name into the provider model id the client (or the
-        // host fulfilling an offload) calls, so the algorithm can route by a label.
-        request.llm_request.model_name = self.model.clone();
+        // Pair the request with its decision; the selected model rides on
+        // `decision.selected_model()`, so the request's `inbound_model_name` is left
+        // untouched. The client (or offload host) reads the model off the decision.
+        let routed = RoutedRequest { request, decision };
         match &self.llm_client {
-            Some(client) => client.call(request).await,
+            Some(client) => client.call(routed).await,
             None => {
-                // No client: offload via a promise on this request's channel,
-                // attaching the decision so the orchestrator can surface it on its
-                // stream. The context has no channel outside an run() run.
+                // No client: offload via a promise on this request's channel. The
+                // decision rides along on the RoutedRequest so the orchestrator can
+                // surface it on its stream. The context has no channel outside a run().
                 let promise_tx = ctx.promise_tx.as_ref().ok_or_else(|| {
                     format!(
                         "target '{}' has no client and no offload channel",
-                        self.name
+                        self.semantic_name
                     )
                 })?;
-                let (tx, rx) = llm_promise(request, decision);
+                let (tx, rx) = llm_promise(routed);
                 promise_tx.send(tx).map_err(|_| "Failed to send promise")?;
                 rx.get_response().await
             }
@@ -369,7 +374,7 @@ impl LlmTargetSet {
     pub fn get_target(&self, name: &str) -> Result<LlmTarget, Box<dyn Error + Send + Sync>> {
         self.targets
             .iter()
-            .find(|t| t.name == name)
+            .find(|t| t.semantic_name == name)
             .cloned()
             .ok_or(format!("Target {} not found", name).into())
     }
@@ -403,7 +408,7 @@ pub trait Algorithm: Send + Sync {
         &self,
         ctx: &Context,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>>;
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>>;
     /// Feed the algorithm agentic-stack events (tool results, budgets, etc.). The
     /// reference algorithms ignore signals; a stateful algorithm updates its own
     /// (interior-mutable) state.
@@ -512,7 +517,7 @@ impl Switchyard {
     pub async fn run_direct(
         &self,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         if !self.algo.get_target_set().all_have_clients() {
             return Err(
                 "Cannot run directly: some targets lack clients and require offloading".into(),
@@ -545,11 +550,14 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for EchoClient {
-        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
-            // Echo back the model the algorithm routed to (the target's name).
+        async fn call(
+            &self,
+            routed: RoutedRequest,
+        ) -> Result<Response, Box<dyn Error + Send + Sync>> {
+            // Echo back the model the algorithm routed to (the decision's selection).
             Ok(Response {
                 llm_response: LlmResponse {
-                    completion: request.llm_request.model_name,
+                    completion: routed.decision.selected_model().to_string(),
                     raw_response: None,
                 },
                 metadata: None,
@@ -563,8 +571,8 @@ mod tests {
         model: String,
     }
 
-    impl DecisionTrace for TestDecision {
-        fn model_decision(&self) -> &str {
+    impl Decision for TestDecision {
+        fn selected_model(&self) -> &str {
             &self.model
         }
         fn reasoning(&self) -> Option<&str> {
@@ -585,17 +593,17 @@ mod tests {
             &self,
             ctx: &Context,
             request: Request,
-        ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+        ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
             let target = self
                 .target_set
                 .targets()
                 .first()
                 .ok_or("no targets")?
                 .clone();
-            let decision: Arc<dyn DecisionTrace> = Arc::new(TestDecision {
-                model: target.name.clone(),
+            let decision: Arc<dyn Decision> = Arc::new(TestDecision {
+                model: target.semantic_name.clone(),
             });
-            let response = target.call(ctx, request, Some(decision.clone())).await?;
+            let response = target.call(ctx, request, decision.clone()).await?;
             Ok((vec![decision], response))
         }
 
@@ -619,7 +627,7 @@ mod tests {
     fn request() -> Request {
         Request {
             llm_request: LlmRequest {
-                model_name: "auto".to_string(),
+                inbound_model_name: "auto".to_string(),
                 prompt: "hi".to_string(),
             },
             raw_request: None,
@@ -632,8 +640,7 @@ mod tests {
         let targets = names
             .iter()
             .map(|(name, has_client)| LlmTarget {
-                name: name.to_string(),
-                model: name.to_string(),
+                semantic_name: name.to_string(),
                 llm_client: has_client.then(|| Arc::new(EchoClient) as Arc<dyn LlmClient>),
             })
             .collect();
@@ -658,10 +665,7 @@ mod tests {
                     saw_call = true;
                     for promise in promises {
                         // The decision rode along with the promise.
-                        assert_eq!(
-                            promise.get_decision().map(|d| d.model_decision()),
-                            Some("offload/model")
-                        );
+                        assert_eq!(promise.get_decision().selected_model(), "offload/model");
                         // Fulfilling the promise is the "real" model call the caller makes.
                         promise
                             .respond(Ok(Response {
@@ -676,7 +680,7 @@ mod tests {
                 }
                 Step::ReturnToAgent(trace, response) => {
                     assert_eq!(trace.len(), 1);
-                    assert_eq!(trace[0].model_decision(), "offload/model");
+                    assert_eq!(trace[0].selected_model(), "offload/model");
                     final_completion = Some(response.llm_response.completion);
                 }
             }
@@ -711,7 +715,7 @@ mod tests {
         );
         match &steps[0] {
             Step::ReturnToAgent(trace, response) => {
-                assert_eq!(trace[0].model_decision(), "direct/model");
+                assert_eq!(trace[0].selected_model(), "direct/model");
                 // EchoClient echoes the model name back as the completion.
                 assert_eq!(response.llm_response.completion, "direct/model");
             }
@@ -730,7 +734,7 @@ mod tests {
         let (trace, response) = orch.run_direct(request()).await?;
         // TestAlgo calls the first target; EchoClient echoes its name.
         assert_eq!(response.llm_response.completion, "direct/model");
-        assert_eq!(trace[0].model_decision(), "direct/model");
+        assert_eq!(trace[0].selected_model(), "direct/model");
         Ok(())
     }
 
@@ -765,12 +769,12 @@ mod tests {
         impl LlmClient for BarrierClient {
             async fn call(
                 &self,
-                request: Request,
+                routed: RoutedRequest,
             ) -> Result<Response, Box<dyn Error + Send + Sync>> {
                 self.barrier.wait().await;
                 Ok(Response {
                     llm_response: LlmResponse {
-                        completion: request.llm_request.model_name,
+                        completion: routed.decision.selected_model().to_string(),
                         raw_response: None,
                     },
                     metadata: None,
@@ -780,8 +784,7 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(N));
         let targets = LlmTargetSet::new(vec![LlmTarget {
-            name: "m".to_string(),
-            model: "m".to_string(),
+            semantic_name: "m".to_string(),
             llm_client: Some(Arc::new(BarrierClient {
                 barrier: barrier.clone(),
             })),

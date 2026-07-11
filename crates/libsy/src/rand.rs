@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 
-use crate::{Algorithm, Context, DecisionTrace, LlmTargetSet, Request, Response, Signals};
+use crate::{Algorithm, Context, Decision, LlmTargetSet, Request, Response, Signals};
 
 /// Decision produced by [`RandomOrchAlgo`]: which target was chosen and why.
 pub struct RandomDecision {
@@ -24,8 +24,8 @@ pub struct RandomDecision {
     pub reasoning: String,
 }
 
-impl DecisionTrace for RandomDecision {
-    fn model_decision(&self) -> &str {
+impl Decision for RandomDecision {
+    fn selected_model(&self) -> &str {
         &self.selected_model
     }
     fn reasoning(&self) -> Option<&str> {
@@ -56,7 +56,7 @@ impl Algorithm for RandomOrchAlgo {
         &self,
         ctx: &Context,
         request: Request,
-    ) -> Result<(Vec<Arc<dyn DecisionTrace>>, Response), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response), Box<dyn Error + Send + Sync>> {
         // Select a target uniformly at random. Scope the RNG so the non-Send
         // `ThreadRng` is dropped before the await below, keeping the returned
         // future `Send` (required by the `Algorithm` bound).
@@ -69,15 +69,15 @@ impl Algorithm for RandomOrchAlgo {
                 .clone()
         };
 
-        // Route by target name; the target maps it to the provider model id when
-        // it serves or offloads the call.
-        let selected = target.name.clone();
-        let decision: Arc<dyn DecisionTrace> = Arc::new(RandomDecision {
+        // Route by target semantic name; the caller's client (or offload host) maps
+        // it to the provider model id when it serves or offloads the call.
+        let selected = target.semantic_name.clone();
+        let decision: Arc<dyn Decision> = Arc::new(RandomDecision {
             reasoning: format!("random routing selected target '{selected}'"),
             selected_model: selected,
         });
 
-        let response = target.call(ctx, request, Some(decision.clone())).await?;
+        let response = target.call(ctx, request, decision.clone()).await?;
         Ok((vec![decision], response))
     }
 
@@ -94,7 +94,7 @@ impl Algorithm for RandomOrchAlgo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response};
+    use crate::{LlmClient, LlmRequest, LlmResponse, LlmTarget, Response, RoutedRequest};
     use std::collections::HashSet;
 
     /// Echoes back the target name it was called with, so a test can tell which
@@ -103,10 +103,13 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for EchoClient {
-        async fn call(&self, request: Request) -> Result<Response, Box<dyn Error + Send + Sync>> {
+        async fn call(
+            &self,
+            routed: RoutedRequest,
+        ) -> Result<Response, Box<dyn Error + Send + Sync>> {
             Ok(Response {
                 llm_response: LlmResponse {
-                    completion: request.llm_request.model_name,
+                    completion: routed.decision.selected_model().to_string(),
                     raw_response: None,
                 },
                 metadata: None,
@@ -117,7 +120,7 @@ mod tests {
     fn request() -> Request {
         Request {
             llm_request: LlmRequest {
-                model_name: "auto".to_string(),
+                inbound_model_name: "auto".to_string(),
                 prompt: "hi".to_string(),
             },
             raw_request: None,
@@ -134,8 +137,7 @@ mod tests {
         let targets: Vec<LlmTarget> = names
             .iter()
             .map(|name| LlmTarget {
-                name: name.to_string(),
-                model: name.to_string(),
+                semantic_name: name.to_string(),
                 llm_client: Some(Arc::new(EchoClient)),
             })
             .collect();
@@ -149,7 +151,7 @@ mod tests {
         let (trace, response) = algo.process_request(&ctx(), request()).await?;
         assert_eq!(response.llm_response.completion, "only/model");
         assert_eq!(trace.len(), 1);
-        assert_eq!(trace[0].model_decision(), "only/model");
+        assert_eq!(trace[0].selected_model(), "only/model");
         Ok(())
     }
 
@@ -166,7 +168,7 @@ mod tests {
                 "selected {selected} not in target set"
             );
             // The trace records the same target that was actually called.
-            assert_eq!(trace[0].model_decision(), selected.as_str());
+            assert_eq!(trace[0].selected_model(), selected.as_str());
         }
         Ok(())
     }
@@ -208,7 +210,7 @@ mod tests {
         let (trace, _) = algo.process_request(&ctx(), request()).await?;
         let decision = &trace[0];
         // Uniform, algo-agnostic access via the trait — no concrete type needed.
-        assert_eq!(decision.model_decision(), "only/model");
+        assert_eq!(decision.selected_model(), "only/model");
         assert!(decision
             .reasoning()
             .unwrap_or_default()
