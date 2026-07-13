@@ -57,6 +57,7 @@
 //!
 //! See the `examples/` directory for runnable agents built on both run modes.
 
+pub mod driver;
 pub mod ensemble;
 pub mod llm_class;
 pub mod rand;
